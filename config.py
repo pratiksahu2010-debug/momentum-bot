@@ -28,22 +28,20 @@ class Config:
     concurrency: int
     log_level: str
     send_startup: bool
-    # --- momentum explosion thresholds ---
-    lookback: int          # breakout channel / volume baseline length
-    vol_mult: float        # last-candle quote volume vs average
-    range_mult: float      # last-candle range vs ATR
-    min_body: float        # body / range
-    close_loc: float       # close position inside the candle (0..1)
+    lookback: int
+    vol_mult: float
+    range_mult: float
+    min_body: float
+    close_loc: float
     rsi_min: float
     rsi_max: float
-    max_ext_atr: float     # max distance from EMA20 in ATR (anti-chase)
-    max_range_atr: float   # max candle range in ATR (anti blow-off)
-    min_avg_qvol: float    # liquidity floor, avg quote volume per candle
+    max_ext_atr: float
+    max_range_atr: float
+    min_avg_qvol: float
     allow_short: bool
     sl_atr: float
     rr1: float
     rr2: float
-    # --- anti-spam ---
     cooldown_min: int
     max_per_hour: int
     max_per_scan: int
@@ -59,10 +57,12 @@ def load() -> Config:
         chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         interval=interval,
         interval_seconds=INTERVAL_SECONDS[interval],
-        base_url=os.getenv("BASE_URL", "https://data-api.binance.vision").rstrip("/"),
+        # Official Binance Spot REST host; can be overridden in Render if needed.
+        base_url=os.getenv("BASE_URL", "https://api.binance.com").rstrip("/"),
         port=_i("PORT", 10000),
         scan_delay=_i("SCAN_DELAY", 4),
-        concurrency=_i("CONCURRENCY", 10),
+        # Keep the burst small; Engine also applies a process-wide request pacer.
+        concurrency=_i("CONCURRENCY", 3),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         send_startup=_b("SEND_STARTUP", False),
         lookback=_i("LOOKBACK", 20),
