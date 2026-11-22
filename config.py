@@ -22,10 +22,8 @@ class Config:
     chat_id: str
     interval: str
     interval_seconds: int
-    base_url: str
+    ws_url: str
     port: int
-    scan_delay: int
-    concurrency: int
     log_level: str
     send_startup: bool
     lookback: int
@@ -57,12 +55,9 @@ def load() -> Config:
         chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         interval=interval,
         interval_seconds=INTERVAL_SECONDS[interval],
-        # Official Binance Spot REST host; can be overridden in Render if needed.
-        base_url=os.getenv("BASE_URL", "https://api.binance.com").rstrip("/"),
+        # Binance documents both :443 and :9443 for Spot market-data streams.
+        ws_url=os.getenv("BINANCE_WS_URL", "wss://stream.binance.com:443").rstrip("/"),
         port=_i("PORT", 10000),
-        scan_delay=_i("SCAN_DELAY", 4),
-        # Keep the burst small; Engine also applies a process-wide request pacer.
-        concurrency=_i("CONCURRENCY", 3),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         send_startup=_b("SEND_STARTUP", False),
         lookback=_i("LOOKBACK", 20),

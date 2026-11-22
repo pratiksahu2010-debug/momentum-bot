@@ -1,41 +1,54 @@
-# Momentum Explosion Bot (Render + Telegram)
+# Momentum Explosion Bot — Binance Spot WebSocket
 
-One signal module, 120 fixed Binance Spot USDT pairs, pure Python, one dependency (`aiohttp`).
+Signal-only Telegram bot. It scans the same fixed universe of 120 Binance Spot USDT pairs and preserves the existing momentum strategy. It does not place orders.
 
-## Data feed and rate-limit protection
-- Uses the official Binance Spot REST host `https://api.binance.com` by default. Set `BASE_URL` only if you intentionally need another official compatible host.
-- Requests are globally paced (one every 120 ms) with at most 3 concurrent workers.
-- On HTTP 429 or 418 the bot stops sending market-data requests and honours Binance's `Retry-After` header. It does not retry a rate-limited request or continue hammering the API.
-- HTTP 418 means Binance has auto-banned the Render outbound IP after earlier rate-limit violations; changing API keys does not fix an IP ban. Wait until `Retry-After` expires. Check `/health` for `last_rate_limit` and `rate_limit_pause_remaining_s`.
+## Market-data architecture
+- **WebSocket only for market data.** One Binance combined-stream connection subscribes to all 120 `<symbol>@kline_5m` streams (or the interval selected by `INTERVAL`).
+- Only candles with Binance's `k.x == true` (closed candle) are evaluated. Partial candles are ignored.
+- The bot makes **no Binance REST market-data requests**. The earlier REST polling path that triggered HTTP 418/429 is removed.
+- The combined connection is rotated before Binance's documented 24-hour connection lifetime. Automatic reconnect uses exponential backoff (1–60 seconds), and aiohttp handles server ping/pong frames.
+- Duplicate candle-open timestamps are ignored. A single in-memory rolling history is maintained per symbol.
 
-## How it detects an explosion (last closed candle only)
-| # | Check | Default |
-|---|---|---|
-| 1 | Quote-volume spike vs 20-candle avg | >= 3.0x |
-| 2 | Range vs ATR(14) | >= 1.8 ATR, body >= 60%, close in top/bottom 25% |
-| 3 | Close breaks prior 20-candle high/low | yes |
-| 4 | RSI band + EMA20 distance | RSI 58-82 (mirrored for short), <= 4 ATR from EMA20 |
+## Startup warm-up
+WebSocket-only means there is no REST candle-history download. Each symbol needs `max(50, LOOKBACK + 16)` closed candles before its existing indicators can be evaluated. With the default 5-minute interval and 50-candle minimum, allow approximately **4 hours 10 minutes** after a fresh process start before all symbols are ready. A symbol is evaluated after its history is ready; no strategy thresholds or indicator calculations are changed. The first qualified candidate for each symbol during warm-up is suppressed, matching the existing warm-up safety behavior.
 
-Also: liquidity floor and late-entry gate. Signal includes Entry / SL / TP1 / TP2.
+## Existing momentum strategy (unchanged)
+| Gate | Default |
+|---|---|
+| Quote-volume spike vs lookback average | >= 3.0x |
+| Range expansion vs ATR(14) | >= 1.8 ATR |
+| Candle body / close location | >= 60% / top or bottom 25% |
+| Donchian breakout | Close beyond prior 20-candle high/low |
+| RSI(14) | 58–82 LONG; mirrored for SHORT |
+| Anti-chase | <= 4 ATR from EMA20 |
+| Liquidity floor | Average quote volume >= 15,000 |
 
-## Anti-spam
-- Only closed candles, each processed once, scan runs just after candle close.
-- Per-symbol cooldown 90 min, max 6 signals/hour, max 3 per scan (best score first), min score 55.
-- First scan after boot is warm-up (never sends) so wake-ups don't fire stale alerts.
-- Telegram sends are serialized with 429 retry handling.
+Risk levels, score formula, minimum score (55), 90-minute symbol cooldown, six alerts/hour and three alerts per scan are unchanged. Each completed kline event is handled independently; Telegram sends remain serialized.
 
 ## Health endpoints
-- `/ping`: empty-body HTTP 200 for external cron/uptime monitors.
+- `/ping`: empty-body HTTP 200 for an external cron/uptime monitor.
 - `/`: plain `ok`.
-- `/health`: status, last scan, totals, rejected gates, suppressed alerts, fetch errors and rate-limit state.
+- `/health`: WebSocket connection, reconnect, warm-up, strategy and alert status.
 - `/health/qualified`, `/health/rejections`, `/health/symbol/BTCUSDT`: diagnostics.
 
-## Deploy
-Render build: `pip install -r requirements.txt`; start: `python main.py`.
-Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Optional `SEND_STARTUP=true`.
-For a Free web service, configure an external cron monitor to GET `https://momentum-bot-fwdp.onrender.com/ping` every 5 minutes. The response body is intentionally empty.
+For Render Free, configure an external cron monitor to GET `https://momentum-bot-fwdp.onrender.com/ping` every 5 minutes. Do not rely on an internal self-ping task.
+
+## Render deployment
+- Build command: `pip install -r requirements.txt`
+- Start command: `python main.py`
+- Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+- Python 3.11.9 is specified in `render.yaml`.
 
 ## Tests
-`python tests/test_strategy.py && python tests/test_engine.py`
+```bash
+python tests/test_strategy.py
+python tests/test_engine.py
+```
 
-Signal-only: the bot does not place orders. Backtest/paper-trade before using alerts for decisions.
+The strategy tests exercise the original evaluator. Engine tests cover closed-candle processing, duplicate suppression and ignoring open candles.
+
+## Operational notes
+- Binance Spot market-data stream docs: https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md
+- Combined streams support up to 1024 streams per connection; this bot uses 120.
+- A Binance Spot WebSocket connection is valid for 24 hours; the bot rotates proactively.
+- WebSocket-only startup trades the convenience of immediate history for eliminating REST market-data polling. If the process restarts, in-memory candle history must be rebuilt.

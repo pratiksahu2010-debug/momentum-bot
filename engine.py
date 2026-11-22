@@ -1,13 +1,19 @@
 import asyncio
+import json
 import logging
 import time
 from collections import Counter, deque
 from datetime import datetime, timezone
 
+import aiohttp
+
 from momentum import GATES, evaluate
 from notifier import format_signal
 
 log = logging.getLogger("engine")
+RECONNECT_MAX_SECONDS = 60
+CONNECTION_ROTATE_SECONDS = 23 * 60 * 60 + 50 * 60
+BATCH_WINDOW_SECONDS = 5
 
 
 def iso(ts):
@@ -15,19 +21,13 @@ def iso(ts):
 
 
 class Engine:
+    """Binance Spot combined-WebSocket consumer; strategy evaluation is unchanged."""
+
     def __init__(self, cfg, session, notifier, symbols):
-        self.cfg, self.session, self.notifier, self.symbols = cfg, session, notifier, symbols
-        self.sem = asyncio.Semaphore(cfg.concurrency)
-        # Pace requests across the whole process, not independently per worker.
-        # 120 symbols at 0.12s spacing completes in about 15 seconds.
-        self.request_interval = 0.12
-        self.request_lock = asyncio.Lock()
-        self.next_request_at = 0.0
-        self.started = time.time()
-        self.pause_until = 0.0
-        self.last_rate_limit = None
-        self.warmup = True
-        self.dead = set()
+        self.cfg, self.session, self.notifier, self.symbols = cfg, session, notifier, list(symbols)
+        self.buffers = {s: deque(maxlen=80) for s in self.symbols}
+        self.required_history = max(50, cfg.lookback + 16)
+        self.warmup_symbols = set(self.symbols)
         self.last_seen = {}
         self.last_signal = {}
         self.sent_times = deque()
@@ -35,135 +35,121 @@ class Engine:
         self.recent = deque(maxlen=30)
         self.totals, self.rejected = Counter(), Counter()
         self.suppressed, self.errors = Counter(), Counter()
+        self.pending_batches = {}
+        self.batch_tasks = {}
+        self.started = time.time()
+        self.connected = False
+        self.connection_count = 0
+        self.reconnects = 0
+        self.last_message_at = None
+        self.last_kline_at = None
         self.last_scan = {}
+        self.last_disconnect = None
+        self.stream_url = self._build_stream_url()
 
-    async def _pace_request(self):
-        async with self.request_lock:
-            now = time.monotonic()
-            wait = self.next_request_at - now
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self.next_request_at = max(now, self.next_request_at) + self.request_interval
+    def _build_stream_url(self):
+        streams = "/".join(f"{symbol.lower()}@kline_{self.cfg.interval}" for symbol in self.symbols)
+        return f"{self.cfg.ws_url.rstrip('/')}/stream?streams={streams}"
 
-    # ---------- data ----------
-    async def _fetch(self, sym):
-        url = f"{self.cfg.base_url}/api/v3/klines"
-        params = {"symbol": sym, "interval": self.cfg.interval, "limit": 80}
-        async with self.sem:
-            for attempt in range(2):
-                if time.time() < self.pause_until:
-                    return None, "rate_limit_pause"
-                await self._pace_request()
-                # A previous in-flight request may have activated the global pause.
-                if time.time() < self.pause_until:
-                    return None, "rate_limit_pause"
-                try:
-                    async with self.session.get(url, params=params) as r:
-                        if r.status in (418, 429):
-                            raw_retry = r.headers.get("Retry-After", "")
-                            try:
-                                retry_after = max(1, int(float(raw_retry)))
-                            except (TypeError, ValueError):
-                                retry_after = 120 if r.status == 418 else 60
-                            self.pause_until = max(self.pause_until, time.time() + retry_after)
-                            self.last_rate_limit = {
-                                "status": r.status,
-                                "retry_after_s": retry_after,
-                                "at": iso(time.time()),
-                            }
-                            # Do not retry a rate-limited request. Stop queued requests too.
-                            log.error("Binance HTTP %s for %s; pausing all market-data requests for %ss",
-                                      r.status, sym, retry_after)
-                            return None, f"http_{r.status}"
-                        if r.status == 400:
-                            body = (await r.text())[:300]
-                            if "Invalid symbol" in body:
-                                return None, "invalid_symbol"
-                            log.warning("Binance HTTP 400 for %s: %s", sym, body)
-                            return None, "http_400"
-                        if r.status == 403:
-                            body = (await r.text())[:200]
-                            log.error("Binance WAF/security block HTTP 403 for %s: %s", sym, body)
-                            return None, "http_403"
-                        if r.status != 200:
-                            body = (await r.text())[:200]
-                            raise RuntimeError(f"http {r.status}: {body}")
-                        return await r.json(), None
-                except Exception as exc:
-                    if attempt == 0:
-                        log.warning("Market-data request failed for %s (%s); retrying once", sym, exc)
-                        await asyncio.sleep(0.5)
-                    else:
-                        log.warning("Market-data request failed for %s: %s", sym, exc)
-            return None, "fetch_error"
-
-    async def _one(self, sym):
-        data, err = await self._fetch(sym)
-        if err:
-            return sym, None, err
-        now_ms = int(time.time() * 1000)
-        if data and int(data[-1][6]) >= now_ms:  # drop still-forming candle
-            data = data[:-1]
-        if not data:
-            return sym, None, "no_data"
-        if self.last_seen.get(sym) == data[-1][0]:
-            return sym, None, "duplicate"
-        self.last_seen[sym] = data[-1][0]
-        return sym, evaluate(sym, data, self.cfg), None
-
-    # ---------- scan ----------
-    async def scan(self):
-        t0 = time.time()
-        if t0 < self.pause_until:
-            self.totals["scans_skipped_rate_limit"] += 1
+    async def on_closed_kline(self, symbol, row):
+        """Accept one Binance-format, CLOSED kline row; safe to call repeatedly."""
+        if symbol not in self.buffers:
             return
-        syms = [s for s in self.symbols if s not in self.dead]
-        results = await asyncio.gather(*(self._one(s) for s in syms))
+        open_time = int(row[0])
+        if open_time <= self.last_seen.get(symbol, -1):
+            self.totals["duplicate_candles"] += 1
+            return
+        self.last_seen[symbol] = open_time
+        candles = self.buffers[symbol]
+        candles.append(row)
+        self.last_kline_at = time.time()
 
-        cands, rej, err = [], Counter(), Counter()
-        evaluated = 0
-        for sym, ev, e in results:
-            if e == "duplicate":
-                continue
-            if e:
-                err[e] += 1
-                if e == "invalid_symbol":
-                    self.dead.add(sym)
-                self.last_eval[sym] = {"at": iso(t0), "passed": False, "reason": e, "depth": -1}
-                continue
-            evaluated += 1
-            self.last_eval[sym] = ev.as_dict(iso(t0))
-            if ev.passed:
-                cands.append(ev)
-            else:
-                rej[ev.reason] += 1
+        if len(candles) < self.required_history:
+            self.totals["warmup_candles"] += 1
+            self.last_eval[symbol] = {
+                "at": iso(time.time()), "passed": False, "reason": "insufficient_data",
+                "depth": 0, "side": "-", "score": 0, "metrics": {},
+            }
+            return
 
-        sent, supp = await self._dispatch(cands, t0)
+        warming = symbol in self.warmup_symbols
+        if warming:
+            self.warmup_symbols.discard(symbol)
+            self.totals["symbols_warmed"] += 1
 
+        ev = evaluate(symbol, list(candles), self.cfg)
+        self.last_eval[symbol] = ev.as_dict(iso(time.time()))
+
+        # Batch the symbols closing the same 5-minute candle. This preserves the
+        # original max_per_scan cap and best-score-first ordering with streaming data.
+        batch = self.pending_batches.get(open_time)
+        if batch is None:
+            batch = {
+                "started": time.time(), "processed": 0, "evaluated": 0,
+                "candidates": [], "rejected": Counter(), "warmup_symbols": set(),
+            }
+            self.pending_batches[open_time] = batch
+            self.batch_tasks[open_time] = asyncio.create_task(self._flush_after(open_time))
+        batch["processed"] += 1
+        batch["evaluated"] += 1
+        if ev.passed:
+            batch["candidates"].append(ev)
+            if warming:
+                batch["warmup_symbols"].add(symbol)
+        else:
+            batch["rejected"][ev.reason] += 1
+
+        if batch["processed"] >= len(self.symbols):
+            await self._flush_batch(open_time)
+
+    async def _flush_after(self, open_time):
+        try:
+            await asyncio.sleep(BATCH_WINDOW_SECONDS)
+            await self._flush_batch(open_time)
+        except asyncio.CancelledError:
+            return
+
+    async def flush_pending(self):
+        """Flush any incomplete candle batches; also useful for deterministic tests."""
+        for open_time in list(self.pending_batches):
+            await self._flush_batch(open_time)
+
+    async def _flush_batch(self, open_time):
+        batch = self.pending_batches.pop(open_time, None)
+        task = self.batch_tasks.pop(open_time, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        if batch is None:
+            return
+
+        now = time.time()
+        candidates = batch["candidates"]
+        sent, suppressed = await self._dispatch(candidates, now, batch["warmup_symbols"])
+        rejected = batch["rejected"]
         self.totals["scans"] += 1
-        self.totals["evaluated"] += evaluated
-        self.totals["qualified"] += len(cands)
+        self.totals["evaluated"] += batch["evaluated"]
+        self.totals["qualified"] += len(candidates)
         self.totals["sent"] += sent
-        self.rejected.update(rej)
-        self.suppressed.update(supp)
-        self.errors.update(err)
-        dur = time.time() - t0
-        self.last_scan = {"at": iso(t0), "ts": t0, "duration_s": round(dur, 1), "evaluated": evaluated,
-                          "qualified": len(cands), "sent": sent, "rejected": dict(rej),
-                          "suppressed": dict(supp), "errors": dict(err)}
-        log.info("scan %.1fs eval=%d qualified=%d sent=%d rejected=%s errors=%s",
-                 dur, evaluated, len(cands), sent, dict(rej), dict(err))
-        self.warmup = False
+        self.rejected.update(rejected)
+        self.suppressed.update(suppressed)
+        self.last_scan = {
+            "at": iso(now), "ts": now, "candle_open": open_time,
+            "duration_s": round(now - batch["started"], 2),
+            "evaluated": batch["evaluated"], "qualified": len(candidates),
+            "sent": sent, "rejected": dict(rejected), "suppressed": dict(suppressed), "errors": {},
+        }
+        log.info("closed-candle batch eval=%d qualified=%d sent=%d rejected=%s suppressed=%s",
+                 batch["evaluated"], len(candidates), sent, dict(rejected), dict(suppressed))
 
-    async def _dispatch(self, cands, now):
+    async def _dispatch(self, candidates, now, warmup_symbols):
         cfg = self.cfg
         while self.sent_times and now - self.sent_times[0] > 3600:
             self.sent_times.popleft()
-        cands.sort(key=lambda e: e.score, reverse=True)
-        sent, supp = 0, Counter()
-        for ev in cands:
+        candidates.sort(key=lambda e: e.score, reverse=True)
+        sent, suppressed = 0, Counter()
+        for ev in candidates:
             reason = None
-            if self.warmup:
+            if ev.symbol in warmup_symbols:
                 reason = "warmup"
             elif ev.score < cfg.min_score:
                 reason = "low_score"
@@ -174,8 +160,10 @@ class Engine:
             elif sent >= cfg.max_per_scan:
                 reason = "scan_cap"
 
-            status = f"suppressed:{reason}" if reason else None
-            if not reason:
+            if reason:
+                status = f"suppressed:{reason}"
+                suppressed[reason] += 1
+            else:
                 ok = await self.notifier.send(format_signal(ev, cfg))
                 if ok:
                     status = "sent" if self.notifier.enabled else "dry_run"
@@ -184,38 +172,83 @@ class Engine:
                     sent += 1
                 else:
                     status = "send_failed"
-                    supp["send_failed"] += 1
-            else:
-                supp[reason] += 1
-            self.recent.appendleft({"at": iso(now), "symbol": ev.symbol, "side": ev.side,
-                                    "score": round(ev.score, 1), "status": status,
-                                    "metrics": ev.m, "levels": {k: round(v, 8) for k, v in ev.levels.items()}})
-        return sent, supp
+                    suppressed["send_failed"] += 1
+            self.recent.appendleft({
+                "at": iso(now), "symbol": ev.symbol, "side": ev.side,
+                "score": round(ev.score, 1), "status": status,
+                "metrics": ev.m, "levels": {k: round(v, 8) for k, v in ev.levels.items()},
+            })
+        return sent, suppressed
+
+    async def _handle_message(self, raw):
+        self.last_message_at = time.time()
+        try:
+            envelope = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            self.errors["invalid_json"] += 1
+            return
+        data = envelope.get("data", envelope)
+        if data.get("e") == "serverShutdown":
+            raise ConnectionError("Binance announced WebSocket server shutdown")
+        if data.get("e") != "kline":
+            return
+        k = data.get("k") or {}
+        if not k.get("x"):  # strategy always evaluates completed candles only
+            return
+        symbol = str(k.get("s") or data.get("s") or "").upper()
+        if symbol not in self.buffers:
+            self.errors["unknown_symbol"] += 1
+            return
+        row = [
+            int(k["t"]), str(k["o"]), str(k["h"]), str(k["l"]),
+            str(k["c"]), str(k["v"]), int(k["T"]), str(k["q"]),
+        ]
+        await self.on_closed_kline(symbol, row)
+
+    async def _consume_connection(self):
+        connected_at = time.monotonic()
+        async with self.session.ws_connect(
+            self.stream_url, heartbeat=30, autoping=True, autoclose=True,
+            timeout=20, receive_timeout=75, max_msg_size=4 * 1024 * 1024,
+        ) as ws:
+            self.connected = True
+            self.connection_count += 1
+            log.info("Binance WebSocket connected: %d kline streams (%s)", len(self.symbols), self.cfg.interval)
+            while time.monotonic() - connected_at < CONNECTION_ROTATE_SECONDS:
+                msg = await ws.receive()
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    await self._handle_message(msg.data)
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
+                    raise ConnectionError("Binance WebSocket closed")
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    raise ConnectionError(f"Binance WebSocket error: {ws.exception()}")
+            log.info("Rotating Binance WebSocket connection before its 24-hour limit")
 
     async def run(self):
-        iv = self.cfg.interval_seconds
-        try:
-            await self.scan()
-        except Exception:
-            log.exception("warmup scan failed")
+        delay = 1
         while True:
-            now = time.time()
-            nxt = (now // iv + 1) * iv + self.cfg.scan_delay
-            await asyncio.sleep(max(0.0, nxt - now))
             try:
-                await self.scan()
-            except Exception:
-                log.exception("scan failed")
+                await self._consume_connection()
+                delay = 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.errors["websocket_disconnects"] += 1
+                self.last_disconnect = {"at": iso(time.time()), "reason": str(exc)[:240]}
+                log.warning("Binance WebSocket disconnected: %s", exc)
+            finally:
+                self.connected = False
+            self.reconnects += 1
+            log.info("Reconnecting to Binance WebSocket in %ss", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, RECONNECT_MAX_SECONDS)
 
-    # ---------- health views ----------
     def status(self):
-        iv = self.cfg.interval_seconds
-        up = time.time() - self.started
-        if time.time() < self.pause_until and self.last_rate_limit:
-            return "rate_limited"
-        if not self.last_scan:
-            return "starting" if up < iv * 2 + 60 else "stale"
-        return "ok" if time.time() - self.last_scan["ts"] <= iv * 3 else "stale"
+        if not self.connected:
+            return "reconnecting" if self.connection_count else "starting"
+        if self.last_message_at is None:
+            return "starting"
+        return "ok" if time.time() - self.last_message_at <= 90 else "stale"
 
     def summary(self):
         c = self.cfg
@@ -223,19 +256,25 @@ class Engine:
             "status": self.status(),
             "uptime_s": int(time.time() - self.started),
             "telegram_configured": self.notifier.enabled,
-            "interval": c.interval,
+            "market_data": "binance_spot_websocket",
+            "websocket_connected": self.connected,
+            "websocket_connections": self.connection_count,
+            "websocket_reconnects": self.reconnects,
+            "websocket_streams": len(self.symbols),
+            "websocket_interval": c.interval,
+            "last_message_at": iso(self.last_message_at) if self.last_message_at else None,
+            "last_kline_at": iso(self.last_kline_at) if self.last_kline_at else None,
+            "last_disconnect": self.last_disconnect,
             "symbols_total": len(self.symbols),
-            "symbols_active": len(self.symbols) - len(self.dead),
-            "invalid_symbols": sorted(self.dead),
-            "warmup_done": not self.warmup,
+            "symbols_ready": len(self.symbols) - len(self.warmup_symbols),
+            "symbols_warming": sorted(self.warmup_symbols),
+            "warmup_done": not self.warmup_symbols,
             "last_scan": {k: v for k, v in self.last_scan.items() if k != "ts"},
-            "last_rate_limit": self.last_rate_limit,
-            "rate_limit_pause_remaining_s": max(0, int(self.pause_until - time.time())),
             "totals": dict(self.totals),
             "rejected_by_gate": {g: self.rejected.get(g, 0) for g in GATES} | {
                 k: v for k, v in self.rejected.items() if k not in GATES},
             "suppressed": dict(self.suppressed),
-            "fetch_errors": dict(self.errors),
+            "stream_errors": dict(self.errors),
             "signals_last_hour": len(self.sent_times),
             "rules": {"vol_x>=": c.vol_mult, "range_atr>=": c.range_mult, "body>=": c.min_body,
                       "close_loc>=": c.close_loc, "rsi": [c.rsi_min, c.rsi_max],
@@ -251,11 +290,16 @@ class Engine:
 
     def rejections_view(self):
         by_reason = {}
-        for sym, e in self.last_eval.items():
-            by_reason.setdefault(e["reason"], []).append(sym)
-        near = [(s, e) for s, e in self.last_eval.items() if not e["passed"] and e.get("depth", -1) >= 4]
-        near.sort(key=lambda x: (-x[1]["depth"], -x[1]["metrics"].get("vol_x", 0)))
-        return {"last_scan": self.last_scan.get("at"),
-                "by_reason": {k: {"count": len(v), "symbols": sorted(v)} for k, v in by_reason.items()},
-                "near_misses": [{"symbol": s, "failed_gate": e["reason"], "gates_passed": e["depth"],
-                                 "side": e["side"], "metrics": e["metrics"]} for s, e in near[:15]]}
+        for symbol, result in self.last_eval.items():
+            by_reason.setdefault(result["reason"], []).append(symbol)
+        near = [(symbol, result) for symbol, result in self.last_eval.items()
+                if not result["passed"] and result.get("depth", -1) >= 4]
+        near.sort(key=lambda item: (-item[1]["depth"], -item[1].get("metrics", {}).get("vol_x", 0)))
+        return {
+            "last_scan": self.last_scan.get("at"),
+            "by_reason": {reason: {"count": len(symbols), "symbols": sorted(symbols)}
+                          for reason, symbols in by_reason.items()},
+            "near_misses": [{"symbol": symbol, "failed_gate": result["reason"],
+                             "gates_passed": result["depth"], "side": result["side"],
+                             "metrics": result.get("metrics", {})} for symbol, result in near[:15]],
+        }

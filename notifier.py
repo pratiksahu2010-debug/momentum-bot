@@ -3,6 +3,8 @@ import logging
 import time
 from datetime import datetime, timezone
 
+import aiohttp
+
 log = logging.getLogger("telegram")
 
 
@@ -38,30 +40,34 @@ class Notifier:
     def enabled(self):
         return bool(self.token and self.chat_id)
 
-    async def send(self, text) -> bool:
+    async def send(self, text):
         if not self.enabled:
             log.info("DRY-RUN (no Telegram creds):\n%s", text)
             return True
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML",
-                   "disable_web_page_preview": True}
-        async with self._lock:  # serialize + 1.1s gap -> never flood Telegram
+        payload = {
+            "chat_id": self.chat_id, "text": text, "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        async with self._lock:
             for _ in range(3):
                 wait = 1.1 - (time.time() - self._last)
                 if wait > 0:
                     await asyncio.sleep(wait)
                 try:
-                    async with self.session.post(url, json=payload) as r:
+                    async with self.session.post(
+                        url, json=payload, timeout=aiohttp.ClientTimeout(total=15)
+                    ) as response:
                         self._last = time.time()
-                        if r.status == 200:
+                        if response.status == 200:
                             return True
-                        if r.status == 429:
-                            data = await r.json()
+                        if response.status == 429:
+                            data = await response.json()
                             await asyncio.sleep(data.get("parameters", {}).get("retry_after", 3) + 1)
                             continue
-                        log.error("Telegram HTTP %s: %s", r.status, (await r.text())[:200])
+                        log.error("Telegram HTTP %s: %s", response.status, (await response.text())[:200])
                         return False
-                except Exception as e:
-                    log.warning("Telegram error: %s", e)
+                except Exception as exc:
+                    log.warning("Telegram error: %s", exc)
                     await asyncio.sleep(2)
         return False
