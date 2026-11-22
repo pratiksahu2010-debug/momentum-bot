@@ -25,8 +25,9 @@ class Engine:
 
     def __init__(self, cfg, session, notifier, symbols):
         self.cfg, self.session, self.notifier, self.symbols = cfg, session, notifier, list(symbols)
-        self.buffers = {s: deque(maxlen=80) for s in self.symbols}
         self.required_history = max(50, cfg.lookback + 16)
+        self.history_size = max(80, self.required_history)
+        self.buffers = {s: deque(maxlen=self.history_size) for s in self.symbols}
         self.warmup_symbols = set(self.symbols)
         self.last_seen = {}
         self.last_signal = {}
@@ -37,6 +38,7 @@ class Engine:
         self.suppressed, self.errors = Counter(), Counter()
         self.pending_batches = {}
         self.batch_tasks = {}
+        self.batch_sent_counts = {}
         self.started = time.time()
         self.connected = False
         self.connection_count = 0
@@ -124,7 +126,15 @@ class Engine:
 
         now = time.time()
         candidates = batch["candidates"]
-        sent, suppressed = await self._dispatch(candidates, now, batch["warmup_symbols"])
+        already_sent = self.batch_sent_counts.get(open_time, 0)
+        remaining_cap = max(0, self.cfg.max_per_scan - already_sent)
+        sent, suppressed = await self._dispatch(
+            candidates, now, batch["warmup_symbols"], max_per_scan=remaining_cap
+        )
+        self.batch_sent_counts[open_time] = already_sent + sent
+        if len(self.batch_sent_counts) > 24:
+            oldest = min(self.batch_sent_counts)
+            self.batch_sent_counts.pop(oldest, None)
         rejected = batch["rejected"]
         self.totals["scans"] += 1
         self.totals["evaluated"] += batch["evaluated"]
@@ -141,8 +151,9 @@ class Engine:
         log.info("closed-candle batch eval=%d qualified=%d sent=%d rejected=%s suppressed=%s",
                  batch["evaluated"], len(candidates), sent, dict(rejected), dict(suppressed))
 
-    async def _dispatch(self, candidates, now, warmup_symbols):
+    async def _dispatch(self, candidates, now, warmup_symbols, max_per_scan=None):
         cfg = self.cfg
+        scan_cap = cfg.max_per_scan if max_per_scan is None else max_per_scan
         while self.sent_times and now - self.sent_times[0] > 3600:
             self.sent_times.popleft()
         candidates.sort(key=lambda e: e.score, reverse=True)
@@ -157,7 +168,7 @@ class Engine:
                 reason = "cooldown"
             elif len(self.sent_times) >= cfg.max_per_hour:
                 reason = "hourly_cap"
-            elif sent >= cfg.max_per_scan:
+            elif sent >= scan_cap:
                 reason = "scan_cap"
 
             if reason:
