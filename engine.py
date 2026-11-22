@@ -18,8 +18,14 @@ class Engine:
     def __init__(self, cfg, session, notifier, symbols):
         self.cfg, self.session, self.notifier, self.symbols = cfg, session, notifier, symbols
         self.sem = asyncio.Semaphore(cfg.concurrency)
+        # Pace requests across the whole process, not independently per worker.
+        # 120 symbols at 0.12s spacing completes in about 15 seconds.
+        self.request_interval = 0.12
+        self.request_lock = asyncio.Lock()
+        self.next_request_at = 0.0
         self.started = time.time()
         self.pause_until = 0.0
+        self.last_rate_limit = None
         self.warmup = True
         self.dead = set()
         self.last_seen = {}
@@ -31,25 +37,65 @@ class Engine:
         self.suppressed, self.errors = Counter(), Counter()
         self.last_scan = {}
 
+    async def _pace_request(self):
+        async with self.request_lock:
+            now = time.monotonic()
+            wait = self.next_request_at - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self.next_request_at = max(now, self.next_request_at) + self.request_interval
+
     # ---------- data ----------
     async def _fetch(self, sym):
         url = f"{self.cfg.base_url}/api/v3/klines"
         params = {"symbol": sym, "interval": self.cfg.interval, "limit": 80}
         async with self.sem:
-            for _ in range(2):
+            for attempt in range(2):
+                if time.time() < self.pause_until:
+                    return None, "rate_limit_pause"
+                await self._pace_request()
+                # A previous in-flight request may have activated the global pause.
+                if time.time() < self.pause_until:
+                    return None, "rate_limit_pause"
                 try:
                     async with self.session.get(url, params=params) as r:
                         if r.status in (418, 429):
-                            self.pause_until = time.time() + int(r.headers.get("Retry-After", 30))
+                            raw_retry = r.headers.get("Retry-After", "")
+                            try:
+                                retry_after = max(1, int(float(raw_retry)))
+                            except (TypeError, ValueError):
+                                retry_after = 120 if r.status == 418 else 60
+                            self.pause_until = max(self.pause_until, time.time() + retry_after)
+                            self.last_rate_limit = {
+                                "status": r.status,
+                                "retry_after_s": retry_after,
+                                "at": iso(time.time()),
+                            }
+                            # Do not retry a rate-limited request. Stop queued requests too.
+                            log.error("Binance HTTP %s for %s; pausing all market-data requests for %ss",
+                                      r.status, sym, retry_after)
                             return None, f"http_{r.status}"
                         if r.status == 400:
-                            return None, "invalid_symbol"
+                            body = (await r.text())[:300]
+                            if "Invalid symbol" in body:
+                                return None, "invalid_symbol"
+                            log.warning("Binance HTTP 400 for %s: %s", sym, body)
+                            return None, "http_400"
+                        if r.status == 403:
+                            body = (await r.text())[:200]
+                            log.error("Binance WAF/security block HTTP 403 for %s: %s", sym, body)
+                            return None, "http_403"
                         if r.status != 200:
-                            raise RuntimeError(f"http {r.status}")
+                            body = (await r.text())[:200]
+                            raise RuntimeError(f"http {r.status}: {body}")
                         return await r.json(), None
-                except Exception:
-                    await asyncio.sleep(0.5)
-        return None, "fetch_error"
+                except Exception as exc:
+                    if attempt == 0:
+                        log.warning("Market-data request failed for %s (%s); retrying once", sym, exc)
+                        await asyncio.sleep(0.5)
+                    else:
+                        log.warning("Market-data request failed for %s: %s", sym, exc)
+            return None, "fetch_error"
 
     async def _one(self, sym):
         data, err = await self._fetch(sym)
@@ -113,7 +159,7 @@ class Engine:
         cfg = self.cfg
         while self.sent_times and now - self.sent_times[0] > 3600:
             self.sent_times.popleft()
-        cands.sort(key=lambda e: e.score, reverse=True)  # best first, caps apply to the rest
+        cands.sort(key=lambda e: e.score, reverse=True)
         sent, supp = 0, Counter()
         for ev in cands:
             reason = None
@@ -149,12 +195,12 @@ class Engine:
     async def run(self):
         iv = self.cfg.interval_seconds
         try:
-            await self.scan()  # warm-up: evaluates, never sends (avoids stale/duplicate alerts on wake)
+            await self.scan()
         except Exception:
             log.exception("warmup scan failed")
         while True:
             now = time.time()
-            nxt = (now // iv + 1) * iv + self.cfg.scan_delay  # just after candle close
+            nxt = (now // iv + 1) * iv + self.cfg.scan_delay
             await asyncio.sleep(max(0.0, nxt - now))
             try:
                 await self.scan()
@@ -165,6 +211,8 @@ class Engine:
     def status(self):
         iv = self.cfg.interval_seconds
         up = time.time() - self.started
+        if time.time() < self.pause_until and self.last_rate_limit:
+            return "rate_limited"
         if not self.last_scan:
             return "starting" if up < iv * 2 + 60 else "stale"
         return "ok" if time.time() - self.last_scan["ts"] <= iv * 3 else "stale"
@@ -181,6 +229,8 @@ class Engine:
             "invalid_symbols": sorted(self.dead),
             "warmup_done": not self.warmup,
             "last_scan": {k: v for k, v in self.last_scan.items() if k != "ts"},
+            "last_rate_limit": self.last_rate_limit,
+            "rate_limit_pause_remaining_s": max(0, int(self.pause_until - time.time())),
             "totals": dict(self.totals),
             "rejected_by_gate": {g: self.rejected.get(g, 0) for g in GATES} | {
                 k: v for k, v in self.rejected.items() if k not in GATES},
@@ -192,7 +242,7 @@ class Engine:
                       "max_ext_atr": c.max_ext_atr, "cooldown_min": c.cooldown_min,
                       "max_per_hour": c.max_per_hour, "max_per_scan": c.max_per_scan,
                       "min_score": c.min_score},
-            "endpoints": ["/health/qualified", "/health/rejections", "/health/symbol/BTCUSDT"],
+            "endpoints": ["/ping", "/health", "/health/qualified", "/health/rejections", "/health/symbol/BTCUSDT"],
         }
 
     def qualified_view(self):
