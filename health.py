@@ -1,17 +1,22 @@
 from aiohttp import web
 
+HEALTH_STARTUP_GRACE_SECONDS = 120
+
 
 def make_app(engine):
     async def root(_):
         return web.Response(text="ok")
 
     async def ping(_):
-        # Cron keep-alive endpoint: HTTP 200 with a deliberately empty body.
+        # Liveness/cron endpoint. Feed readiness is reported separately by /health.
         return web.Response(status=200)
 
     async def health(_):
         s = engine.summary()
-        return web.json_response(s, status=503 if s["status"] == "stale" else 200)
+        # Allow the initial WebSocket handshake/warm-up, then make disconnected,
+        # reconnecting and stale feeds visible to Render's readiness check.
+        unhealthy = s["status"] != "ok" and s["uptime_s"] >= HEALTH_STARTUP_GRACE_SECONDS
+        return web.json_response(s, status=503 if unhealthy else 200)
 
     async def qualified(_):
         return web.json_response(engine.qualified_view())
