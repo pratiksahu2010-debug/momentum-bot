@@ -14,7 +14,7 @@ Signal-only Telegram bot. It scans the same fixed universe of 120 Binance Spot U
 ## Startup history bootstrap
 - Default: `HISTORY_BOOTSTRAP=true`; set it to `false` to return to WebSocket-only warm-up.
 - REST base URL: `BINANCE_REST_URL` (default `https://api.binance.com`).
-- The bot requests up to 60 recent klines per symbol, with bounded concurrency (8), short request timeouts, and limited retries for rate limits/transient server errors.
+- The bot requests up to 60 recent klines per symbol from Binance public market-data REST (`https://data-api.binance.vision`) with two in-flight requests and a 250 ms global request-start spacing. If Binance returns HTTP 418/429, the remaining REST bootstrap is aborted immediately; it does not hammer the endpoint with retries. The live WebSocket starts immediately and continues independently while history is fetched.
 - Each symbol needs `max(50, LOOKBACK + 16)` contiguous closed candles. With the default 5-minute interval, a successful bootstrap normally makes all 120 symbols strategy-ready shortly after the WebSocket begins delivering fresh closed candles.
 - Health reports bootstrap loaded/failed counts separately from live WebSocket candle timestamps.
 
@@ -49,7 +49,7 @@ For Render Free, configure an external cron monitor to GET `https://momentum-bot
 - Build command: `pip install -r requirements.txt`
 - Start command: `python main.py`
 - Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
-- Optional: `HISTORY_BOOTSTRAP=true`, `BINANCE_REST_URL=https://api.binance.com`.
+- Optional: `HISTORY_BOOTSTRAP=true`, `BINANCE_REST_URL=https://data-api.binance.vision`.
 - Python 3.11.9 is specified in `render.yaml`.
 
 ## Tests
