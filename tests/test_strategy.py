@@ -60,3 +60,15 @@ if __name__ == "__main__":
     for n, f in list(globals().items()):
         if n.startswith("test_"):
             f(); print("ok", n)
+
+
+def test_close_location_and_range_are_not_mandatory_setup_gates():
+    from dataclasses import replace
+    candles = base()
+    p = float(candles[-1][4])
+    # Lower close location and range expansion must not become hard setup gates.
+    candles.append(kl(p, p + 0.50, p - 0.10, p + 0.20, 250000, 79))
+    cfg_soft = replace(cfg, close_loc=0.70, range_mult=99.0)
+    ev = evaluate("TESTUSDT", candles, cfg_soft)
+    assert ev.passed, (ev.reason, ev.m)
+    assert ev.depth == 4
