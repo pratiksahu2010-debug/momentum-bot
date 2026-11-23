@@ -1,10 +1,11 @@
 # Momentum Explosion Bot — Binance Spot WebSocket
 
-Signal-only Telegram bot. It scans the same fixed universe of 120 Binance Spot USDT pairs and preserves the existing momentum strategy. It does not place orders.
+Signal-only Telegram bot. It scans a core universe of liquid Binance Spot USDT pairs, validates active markets at startup, and fills inactive slots with the highest 24-hour quote-volume eligible pairs. The existing momentum strategy is preserved. It does not place orders.
 
 ## Market-data architecture
-- **Live market data uses one Binance combined WebSocket connection** for all 120 `<symbol>@kline_5m` streams (or the interval selected by `INTERVAL`).
-- At startup, the bot makes a **one-time historical bootstrap** using Binance Spot `GET /api/v3/klines`: it requests enough recent candles for each symbol to seed the existing indicator history. This is a finite startup snapshot, not polling.
+- **Startup universe validation** makes one `GET /api/v3/exchangeInfo` request and, only when replacements are needed, one `GET /api/v3/ticker/24hr` snapshot. It excludes pairs that are not currently `TRADING` Binance Spot USDT markets and replaces missing slots by 24-hour quote volume. If the ranking snapshot fails, it uses only the validated configured pairs; if exchange metadata is unavailable, it falls back to the cleaned static core (the six known delisted pairs are removed). The selected/rejected/replacement lists are visible in `/health` under `symbol_validation`.
+- **Live market data uses one Binance combined WebSocket connection** for all validated `<symbol>@kline_5m` streams (or the interval selected by `INTERVAL`).
+- After universe validation, the bot makes a **one-time historical bootstrap** using Binance Spot `GET /api/v3/klines`: it requests enough recent candles for each symbol to seed the existing indicator history. This is a finite startup snapshot, not polling.
 - Only fully closed candles are accepted from REST or WebSocket. Historical candles seed buffers only; they are never evaluated or sent as backdated alerts.
 - After bootstrap, all live updates and strategy evaluations come from the WebSocket. The bot does not run periodic REST market-data polling.
 - If a REST request fails or a symbol has insufficient contiguous history, that symbol stays in WebSocket warm-up. Bootstrap failures do not stop the bot.
@@ -16,7 +17,7 @@ Signal-only Telegram bot. It scans the same fixed universe of 120 Binance Spot U
 - REST base URL: `BINANCE_REST_URL` (default `https://api.binance.com`).
 - The bot requests up to 60 recent klines per symbol from Binance public market-data REST (`https://data-api.binance.vision`) with two in-flight requests and a 250 ms global request-start spacing. If Binance returns HTTP 418/429, it stops the current batch, honors `Retry-After`, and retries only the symbols still missing after the cooldown. It does not hammer the endpoint while the IP is restricted. The live WebSocket continues independently during the wait.
 - Binance's public ZIP archive (`data.binance.vision/data/spot/daily/...`) is useful for historical research, but daily files are published the next day; they cannot supply the current session's missing candles. The bot therefore does not use stale archive candles to bridge a live-data gap or create misleading indicator history.
-- Each symbol needs `max(50, LOOKBACK + 16)` contiguous closed candles. With the default 5-minute interval, a successful bootstrap normally makes all 120 symbols strategy-ready shortly after the WebSocket begins delivering fresh closed candles.
+- Each active symbol needs `max(50, LOOKBACK + 16)` contiguous closed candles. With the default 5-minute interval, a successful bootstrap normally makes the validated universe strategy-ready shortly after the WebSocket begins delivering fresh closed candles.
 - Health reports bootstrap loaded/failed counts separately from live WebSocket candle timestamps.
 
 ## Balanced four-gate momentum strategy
