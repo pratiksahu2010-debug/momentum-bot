@@ -616,7 +616,12 @@ class Engine:
             "history_bootstrap_completed_at": iso(self.bootstrap_completed_at) if self.bootstrap_completed_at else None,
             "history_bootstrap_loaded_symbols": self.bootstrap_loaded_symbols,
             "history_bootstrap_failed_symbols": self.bootstrap_failed_symbols,
+            "history_bootstrap_retrying": self.bootstrap_enabled and self.bootstrap_completed_at is None,
+            "gap_recovery_in_progress": sorted(
+                symbol for symbol, task in self.recovery_tasks.items() if not task.done()
+            ),
             "history_last_candle_at": iso(self.history_last_candle_at) if self.history_last_candle_at else None,
+            "telegram_delivery": dict(getattr(self.notifier, "stats", {})),
             "last_scan": {k: v for k, v in self.last_scan.items() if k != "ts"},
             "totals": dict(self.totals),
             "rejected_by_gate": {g: self.rejected.get(g, 0) for g in GATES} | {
