@@ -50,7 +50,7 @@ class Notifier:
             "disable_web_page_preview": True,
         }
         async with self._lock:
-            for _ in range(3):
+            for attempt in range(3):
                 wait = 1.1 - (time.time() - self._last)
                 if wait > 0:
                     await asyncio.sleep(wait)
@@ -59,15 +59,29 @@ class Notifier:
                         url, json=payload, timeout=aiohttp.ClientTimeout(total=15)
                     ) as response:
                         self._last = time.time()
-                        if response.status == 200:
+                        try:
+                            data = await response.json(content_type=None)
+                        except (ValueError, aiohttp.ContentTypeError):
+                            data = {}
+                        if response.status == 200 and data.get("ok") is True:
                             return True
                         if response.status == 429:
-                            data = await response.json()
-                            await asyncio.sleep(data.get("parameters", {}).get("retry_after", 3) + 1)
+                            retry_after = data.get("parameters", {}).get("retry_after", 3)
+                            try:
+                                retry_after = max(1, min(60, int(retry_after)))
+                            except (TypeError, ValueError):
+                                retry_after = 3
+                            log.warning("Telegram rate limited; retrying after %ss", retry_after)
+                            await asyncio.sleep(retry_after + 1)
                             continue
-                        log.error("Telegram HTTP %s: %s", response.status, (await response.text())[:200])
+                        detail = data.get("description") or str(data) or (await response.text())[:200]
+                        log.error("Telegram delivery failed HTTP %s: %s", response.status, detail)
+                        if response.status >= 500 and attempt < 2:
+                            await asyncio.sleep(2 * (attempt + 1))
+                            continue
                         return False
-                except Exception as exc:
-                    log.warning("Telegram error: %s", exc)
-                    await asyncio.sleep(2)
-        return False
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    log.warning("Telegram network error (attempt %d/3): %s", attempt + 1, exc)
+                    if attempt < 2:
+                        await asyncio.sleep(2 * (attempt + 1))
+            return False
