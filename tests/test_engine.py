@@ -31,7 +31,7 @@ def test_closed_candle_signal_and_duplicate_guard():
             await engine.on_closed_kline("TESTUSDT", candle)
         assert engine.summary()["symbols_ready"] == 1
         p = float(ts.base()[-1][4])
-        breakout = ts.kl(p, p + 0.5, p - 0.02, p + 0.46, 250000, 79)
+        breakout = ts.kl(p, p + 0.416, p - 0.104, p + 0.416, 250000, 79)
         await engine.on_closed_kline("TESTUSDT", breakout)
         assert len(notifier.msgs) == 1, engine.last_eval["TESTUSDT"]
         assert "MOMENTUM EXPLOSION" in notifier.msgs[0]
@@ -52,7 +52,7 @@ def test_per_candle_batch_cap():
             for symbol in symbols:
                 await engine.on_closed_kline(symbol, candle)
         p = float(history[-1][4])
-        breakout = ts.kl(p, p + 0.5, p - 0.02, p + 0.46, 250000, 79)
+        breakout = ts.kl(p, p + 0.416, p - 0.104, p + 0.416, 250000, 79)
         for symbol in symbols:
             await engine.on_closed_kline(symbol, breakout)
         assert len(notifier.msgs) == cfg.max_per_scan == 3
@@ -83,7 +83,7 @@ def test_gap_clears_history_and_restarts_warmup():
         assert len(engine.buffers["TESTUSDT"]) == len(ts.base())
         p = float(ts.base()[-1][4])
         # Skip one full 5-minute interval (expected index 79, received index 80).
-        gap_candle = ts.kl(p, p + 0.5, p - 0.02, p + 0.46, 250000, 80)
+        gap_candle = ts.kl(p, p + 0.416, p - 0.104, p + 0.416, 250000, 80)
         await engine.on_closed_kline("TESTUSDT", gap_candle)
         assert len(engine.buffers["TESTUSDT"]) == 1
         assert "TESTUSDT" in engine.warmup_symbols
