@@ -18,7 +18,7 @@ STABLE_BASES = {
 
 
 async def resolve_symbols(session, configured):
-    """Keep configured active USDT spot pairs and fill removed slots by 24h quote volume."""
+    """Validate configured pairs once and fill gaps with liquid active USDT spot pairs."""
     result = {
         "validation_ok": False,
         "configured": len(configured),
@@ -52,53 +52,64 @@ async def resolve_symbols(session, configured):
         }
         kept = [symbol for symbol in configured if symbol in active]
         rejected = [symbol for symbol in configured if symbol not in active]
-        result["validation_ok"] = True
-        result["active_configured"] = kept
-        result["rejected_configured"] = rejected
+        result.update({
+            "validation_ok": True,
+            "active_configured": kept,
+            "rejected_configured": rejected,
+        })
 
-        # If the fixed universe has gaps, use one all-symbol 24h ticker snapshot
-        # to fill them with the most liquid active USDT spot pairs.
-        missing = max(0, len(configured) - len(kept))
         replacements = []
+        missing = max(0, len(configured) - len(kept))
         if missing:
-            async with session.get(
-                f"{base_url}/api/v3/ticker/24hr",
-                timeout=request_timeout,
-            ) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"24hr ticker HTTP {response.status}")
-                tickers = await response.json()
-            candidates = []
-            for ticker in tickers if isinstance(tickers, list) else []:
-                symbol = ticker.get("symbol", "")
-                if symbol not in active or symbol in kept:
-                    continue
-                base = symbol[:-4] if symbol.endswith("USDT") else ""
-                if not base or base in STABLE_BASES or base.endswith(("UP", "DOWN", "BULL", "BEAR")):
-                    continue
-                try:
-                    quote_volume = float(ticker.get("quoteVolume", 0))
-                except (TypeError, ValueError):
-                    continue
-                if quote_volume > 0:
-                    candidates.append((quote_volume, symbol))
-            candidates.sort(reverse=True)
-            replacements = [symbol for _, symbol in candidates[:missing]]
-            kept.extend(replacements)
+            try:
+                async with session.get(
+                    f"{base_url}/api/v3/ticker/24hr",
+                    timeout=request_timeout,
+                ) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"24hr ticker HTTP {response.status}")
+                    tickers = await response.json()
+                candidates = []
+                for ticker in tickers if isinstance(tickers, list) else []:
+                    if not isinstance(ticker, dict):
+                        continue
+                    symbol = ticker.get("symbol", "")
+                    if symbol not in active or symbol in kept:
+                        continue
+                    base = symbol[:-4] if symbol.endswith("USDT") else ""
+                    if not base or base in STABLE_BASES or base.endswith(("UP", "DOWN", "BULL", "BEAR")):
+                        continue
+                    try:
+                        quote_volume = float(ticker.get("quoteVolume", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if quote_volume > 0:
+                        candidates.append((quote_volume, symbol))
+                candidates.sort(reverse=True)
+                replacements = [symbol for _, symbol in candidates[:missing]]
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as exc:
+                # The exchangeInfo validation is still authoritative. Run the smaller
+                # validated universe rather than restoring delisted or suspended pairs.
+                result["replacement_error"] = str(exc)[:200]
+                log.warning("Could not fetch replacement ranking; using %d validated configured pairs: %s",
+                            len(kept), exc)
 
+        kept.extend(replacements)
         if not kept:
             raise RuntimeError("No configured symbols are currently active Binance Spot USDT markets")
-        result["replacements"] = replacements
-        result["active_total"] = len(kept)
-        result["target_total"] = len(configured)
+        result.update({
+            "replacements": replacements,
+            "active_total": len(kept),
+            "target_total": len(configured),
+        })
         log.info(
             "Binance universe validated: configured=%d active=%d rejected=%s replacements=%s",
             len(configured), len(kept), rejected, replacements,
         )
         return kept, result
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, RuntimeError) as exc:
-        # The six known delisted pairs are removed from symbols.py, so fallback
-        # remains a safe 114-symbol core rather than reconnecting stale markets.
+        # The known delisted pairs are already removed from symbols.py. If the
+        # metadata endpoint itself is unreachable, use that cleaned static core.
         result["validation_error"] = str(exc)[:240]
         result["active_total"] = len(configured)
         result["target_total"] = len(configured)
@@ -111,7 +122,7 @@ log = logging.getLogger("main")
 async def main():
     cfg = load()
     logging.basicConfig(level=cfg.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    # No REST market-data calls are made. Keep the session open for the WS feed and Telegram.
+    # Keep one shared session for startup market metadata, historical candles, WebSocket, and Telegram.
     timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_connect=15, sock_read=None)
     async with aiohttp.ClientSession(
         timeout=timeout,
