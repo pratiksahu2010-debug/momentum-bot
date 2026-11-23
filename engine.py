@@ -71,6 +71,7 @@ class Engine:
         self.history_last_request_at = 0.0
         self.history_last_candle_at = None
         self.last_scan = {}
+        self.symbol_validation = {"validation_ok": None, "configured": len(self.symbols), "active_total": len(self.symbols), "rejected_configured": [], "replacements": []}
         self.stream_url = self._build_stream_url()
 
     def _build_stream_url(self):
@@ -537,6 +538,7 @@ class Engine:
             "last_kline_at": iso(self.last_kline_at) if self.last_kline_at else None,
             "last_disconnect": self.last_disconnect,
             "symbols_total": len(self.symbols),
+            "symbol_validation": self.symbol_validation,
             "symbols_ready": ready,
             "symbols_warming": sorted(self.warmup_symbols),
             "warmup_done": not self.warmup_symbols,
