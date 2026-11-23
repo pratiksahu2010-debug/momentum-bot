@@ -49,7 +49,7 @@ class Engine:
         self.suppressed, self.errors = Counter(), Counter()
         self.pending_batches = {}
         self.batch_tasks = {}
-        self.flushed_batch_order = deque(maxlen=32)
+        self.flushed_batch_order = deque()
         self.flushed_batch_set = set()
         self.started = time.time()
         self.connected = False
