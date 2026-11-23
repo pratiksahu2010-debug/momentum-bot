@@ -320,7 +320,7 @@ class Engine:
         missing_symbols = sorted(set(self.symbols) - batch["symbols_seen"])
         self.flushed_batch_order.append(open_time)
         self.flushed_batch_set.add(open_time)
-        while len(self.flushed_batch_set) > self.flushed_batch_order.maxlen:
+        while len(self.flushed_batch_order) > 32:
             oldest = self.flushed_batch_order.popleft()
             self.flushed_batch_set.discard(oldest)
         coverage = 100.0 * batch["evaluated"] / len(self.symbols)
