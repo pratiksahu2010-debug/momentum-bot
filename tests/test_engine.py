@@ -61,6 +61,36 @@ def test_per_candle_has_no_alert_cap():
     asyncio.run(run())
 
 
+def test_incomplete_batch_reports_missing_and_late_symbol_is_still_evaluated():
+    async def run():
+        cfg = load()
+        notifier = FakeNotifier()
+        engine = Engine(cfg, session=None, notifier=notifier, symbols=["AUSDT", "BUSDT"])
+        history = ts.base()
+        now_ms = int(history[-1][6]) + 1
+        assert engine._seed_history("AUSDT", history, now_ms=now_ms)
+        assert engine._seed_history("BUSDT", history, now_ms=now_ms)
+
+        p = float(history[-1][4])
+        late_candle = ts.kl(p, p + 0.416, p - 0.104, p + 0.312, 250000, 79)
+        await engine.on_closed_kline("AUSDT", late_candle)
+        await engine.flush_pending()
+
+        assert engine.last_scan["evaluated"] == 1
+        assert engine.last_scan["missing_symbols"] == ["BUSDT"]
+        assert engine.last_scan["coverage_pct"] == 50.0
+
+        # A delayed symbol must not create a second scan or lose its candidate.
+        await engine.on_closed_kline("BUSDT", late_candle)
+        assert engine.totals["scans"] == 1
+        assert engine.totals["late_candle_arrivals"] == 1
+        assert engine.last_scan["late_arrivals"] == 1
+        assert engine.totals["evaluated"] == 2
+        assert len(notifier.msgs) == 2
+
+    asyncio.run(run())
+
+
 def test_stream_message_ignores_open_candles():
     async def run():
         engine = Engine(load(), session=None, notifier=FakeNotifier(), symbols=["TESTUSDT"])
