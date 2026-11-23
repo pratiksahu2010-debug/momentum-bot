@@ -216,31 +216,35 @@ class Engine:
         return False
 
     async def bootstrap_history(self):
-        """Fetch historical candles; on 418/429 wait for Retry-After before one paced retry."""
+        """Continuously and safely seed missing symbols; never blocks the live WebSocket."""
         if not self.bootstrap_enabled:
             log.info("Historical bootstrap disabled; using WebSocket warm-up")
-            return
-        if self.bootstrap_completed_at is not None:
             return
 
         semaphore = asyncio.Semaphore(HISTORY_CONCURRENCY)
         loaded_symbols = set()
-        while True:
+        consecutive_failures = 0
+        retry_base = 30
+        retry_cap = 900
+
+        while len(loaded_symbols) < len(self.symbols):
             self.bootstrap_started_at = self.bootstrap_started_at or time.time()
             self.history_bootstrap_attempts += 1
+            pending_symbols = [s for s in self.symbols if s not in loaded_symbols]
             log.info(
-                "Starting Binance history bootstrap attempt %d: %d symbols, %d closed candles each",
-                self.history_bootstrap_attempts, len(self.symbols), self.required_history,
+                "Starting Binance history bootstrap attempt %d: %d pending symbols, %d closed candles each",
+                self.history_bootstrap_attempts, len(pending_symbols), self.required_history,
             )
+
             results = await asyncio.gather(
-                *(self._fetch_symbol_history(symbol, semaphore) for symbol in self.symbols
-                  if symbol not in loaded_symbols),
+                *(self._fetch_symbol_history(symbol, semaphore) for symbol in pending_symbols),
                 return_exceptions=True,
             )
-            pending_symbols = [s for s in self.symbols if s not in loaded_symbols]
+            newly_loaded = 0
             for symbol, result in zip(pending_symbols, results):
                 if result is True:
                     loaded_symbols.add(symbol)
+                    newly_loaded += 1
                 elif isinstance(result, Exception):
                     self.errors["history_unhandled_errors"] += 1
                     log.warning("History bootstrap exception for %s: %s", symbol, str(result)[:180])
@@ -250,27 +254,45 @@ class Engine:
             self.totals["history_bootstrap_loaded_symbols"] = self.bootstrap_loaded_symbols
             self.totals["history_bootstrap_failed_symbols"] = self.bootstrap_failed_symbols
 
-            if not self.history_rate_limited:
+            if not pending_symbols or self.bootstrap_failed_symbols == 0:
                 break
 
-            # Honor Binance's Retry-After instead of retrying the banned IP.
-            # The live WebSocket continues collecting candles while this task sleeps.
-            wait_seconds = max(1, int((self.history_retry_after_at or (time.time() + 60)) - time.time()))
-            log.warning(
-                "Historical bootstrap paused by Binance rate limit; retrying once the cooldown expires in %ds",
-                wait_seconds,
-            )
+            if newly_loaded:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+
+            # Honour an exchange ban exactly; otherwise back off progressively for
+            # transient network/5xx/invalid-history failures. Retry only missing pairs.
+            if self.history_rate_limited:
+                wait_seconds = max(
+                    1, int((self.history_retry_after_at or (time.time() + retry_base)) - time.time())
+                )
+                log.warning(
+                    "Binance history rate-limited; pausing remaining %d symbols for %ds",
+                    self.bootstrap_failed_symbols, wait_seconds,
+                )
+            else:
+                wait_seconds = min(retry_cap, retry_base * (2 ** min(consecutive_failures - 1, 5)))
+                log.warning(
+                    "History bootstrap incomplete: %d/%d loaded; retrying only missing symbols in %ds",
+                    self.bootstrap_loaded_symbols, len(self.symbols), wait_seconds,
+                )
+
             await asyncio.sleep(wait_seconds)
             self.history_rate_limited = False
             self.history_retry_after_at = None
             self.history_last_request_at = 0.0
 
-        self.bootstrap_completed_at = time.time()
-        log.info(
-            "History bootstrap completed: loaded=%d/%d still_warming=%d attempts=%d; WebSocket remains live source",
-            self.bootstrap_loaded_symbols, len(self.symbols), len(self.warmup_symbols),
-            self.history_bootstrap_attempts,
-        )
+        if self.bootstrap_failed_symbols == 0:
+            self.bootstrap_completed_at = time.time()
+            log.info(
+                "History bootstrap completed: loaded=%d/%d attempts=%d; WebSocket remains live source",
+                self.bootstrap_loaded_symbols, len(self.symbols), self.history_bootstrap_attempts,
+            )
+        else:
+            # Defensive fallback; the loop normally continues until every symbol is seeded.
+            log.warning("History bootstrap stopped with %d symbols still warming", self.bootstrap_failed_symbols)
 
     async def on_closed_kline(self, symbol, row):
         """Accept one Binance-format, CLOSED kline row; safe to call repeatedly."""
