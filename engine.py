@@ -71,7 +71,7 @@ class Engine:
         self.history_last_request_at = 0.0
         self.history_last_candle_at = None
         self.last_scan = {}
-        self.symbol_validation = {"validation_ok": None, "configured": len(self.symbols), "active_total": len(self.symbols), "rejected_configured": [], "replacements": []}
+        self.symbol_validation = {"validation_ok": None, "configured": len(self.symbols), "active_total": None, "selected_total": len(self.symbols), "rejected_configured": [], "replacements": []}
         self.stream_url = self._build_stream_url()
 
     def _build_stream_url(self):
