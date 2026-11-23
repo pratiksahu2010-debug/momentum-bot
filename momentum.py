@@ -135,7 +135,8 @@ def evaluate(symbol, k, cfg) -> Eval:
         40 * _clip(vol_x / (cfg.vol_mult * 2))
         + 30 * _clip(range_atr / (cfg.range_mult * 2))
         + 15 * _clip((loc - cfg.close_loc) / (1 - cfg.close_loc))
-        + 15 * _clip(1 - abs(rsi_dir - 70) / 15)
+        + 15 * _clip(1 - abs(rsi_dir - (cfg.rsi_min + cfg.rsi_max) / 2)
+                      / ((cfg.rsi_max - cfg.rsi_min) / 2))
     )
     ev.levels = {
         "entry": c[-1], "sl": sl,
