@@ -30,7 +30,7 @@ class Engine:
             raise ValueError("Symbol universe must contain 1..1024 symbols")
         if len(set(self.symbols)) != len(self.symbols):
             raise ValueError("Symbol universe contains duplicates")
-        invalid = [s for s in self.symbols if not re.fullmatch(r"[A-Z0-9]{2,20}USDT", s)]
+        invalid = [s for s in self.symbols if not re.fullmatch(r"[A-Z0-9]{1,20}USDT", s)]
         if invalid:
             raise ValueError(f"Invalid Binance USDT symbol format: {invalid[:10]}")
         self.required_history = max(50, cfg.lookback + 16)
