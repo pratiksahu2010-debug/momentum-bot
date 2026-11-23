@@ -49,6 +49,7 @@ class Notifier:
         if not self.enabled:
             log.info("DRY-RUN (no Telegram creds):\n%s", text)
             return True
+
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         payload = {
             "chat_id": self.chat_id, "text": text, "parse_mode": "HTML",
@@ -71,33 +72,42 @@ class Notifier:
                             data = {}
                         if not isinstance(data, dict):
                             data = {}
+
                         if response.status == 200 and data.get("ok") is True:
                             self.stats["delivered"] += 1
                             self.stats["last_success_at"] = datetime.now(timezone.utc).isoformat()
                             self.stats["last_error"] = None
                             return True
+
                         if response.status == 429:
                             self.stats["rate_limits"] += 1
-                            retry_after = data.get("parameters", {}).get("retry_after", 3)
+                            params = data.get("parameters") or {}
+                            retry_after = params.get("retry_after", 3) if isinstance(params, dict) else 3
                             try:
                                 retry_after = max(1, min(3600, int(retry_after)))
                             except (TypeError, ValueError, OverflowError):
                                 retry_after = 3
+                            self.stats["last_error"] = f"Telegram rate limited; retry_after={retry_after}s"
                             log.warning("Telegram rate limited; retrying after %ss", retry_after)
-                            await asyncio.sleep(retry_after + 1)
-                            continue
-                        detail = data.get("description") or str(data) or (await response.text())[:200]
+                            if attempt < 2:
+                                await asyncio.sleep(retry_after + 1)
+                                continue
+                            break
+
+                        detail = data.get("description") or str(data)
                         self.stats["last_error"] = f"HTTP {response.status}: {str(detail)[:180]}"
                         log.error("Telegram delivery failed HTTP %s: %s", response.status, detail)
                         if response.status >= 500 and attempt < 2:
                             await asyncio.sleep(2 * (attempt + 1))
                             continue
-                        self.stats["failed"] += 1
-            return False
+                        break
+
                 except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                     self.stats["network_errors"] += 1
                     self.stats["last_error"] = str(exc)[:180]
                     log.warning("Telegram network error (attempt %d/3): %s", attempt + 1, exc)
                     if attempt < 2:
                         await asyncio.sleep(2 * (attempt + 1))
+
+            self.stats["failed"] += 1
             return False
