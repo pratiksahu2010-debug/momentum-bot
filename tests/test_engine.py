@@ -163,3 +163,62 @@ def test_rest_history_discards_gap_before_seeding():
     # The most recent uninterrupted tail is shorter than the 50-candle requirement.
     assert not engine._seed_history("TESTUSDT", rows, now_ms=now_ms)
     assert len(engine.buffers["TESTUSDT"]) == 0
+
+
+def test_history_bootstrap_retries_only_missing_symbols(monkeypatch):
+    async def run():
+        cfg = load()
+        engine = Engine(cfg, session=object(), notifier=FakeNotifier(), symbols=["AUSDT", "BUSDT"])
+        calls = {"AUSDT": 0, "BUSDT": 0}
+
+        async def fake_fetch(symbol, semaphore):
+            calls[symbol] += 1
+            return symbol == "AUSDT" or calls[symbol] >= 2
+
+        async def no_wait(_seconds):
+            return None
+
+        monkeypatch.setattr(engine, "_fetch_symbol_history", fake_fetch)
+        monkeypatch.setattr(asyncio, "sleep", no_wait)
+        await engine.bootstrap_history()
+
+        assert calls == {"AUSDT": 1, "BUSDT": 2}
+        assert engine.bootstrap_loaded_symbols == 2
+        assert engine.bootstrap_failed_symbols == 0
+        assert engine.bootstrap_completed_at is not None
+
+    asyncio.run(run())
+
+
+def test_post_bootstrap_candle_gap_schedules_targeted_history_recovery(monkeypatch):
+    async def run():
+        cfg = load()
+        engine = Engine(cfg, session=object(), notifier=FakeNotifier(), symbols=["TESTUSDT"])
+        history = ts.base()
+        for candle in history:
+            await engine.on_closed_kline("TESTUSDT", candle)
+        engine.bootstrap_completed_at = 1.0
+
+        calls = []
+
+        async def fake_fetch(symbol, semaphore):
+            calls.append(symbol)
+            # Simulate REST returning the contiguous closed history, including
+            # the latest live candle, without evaluating any historical signal.
+            rows = ts.base()
+            engine._seed_history(symbol, rows, now_ms=int(rows[-1][6]) + 1)
+            return symbol not in engine.warmup_symbols
+
+        monkeypatch.setattr(engine, "_fetch_symbol_history", fake_fetch)
+        p = float(history[-1][4])
+        gap = ts.kl(p, p + 0.416, p - 0.104, p + 0.312, 900000, 80)
+        await engine.on_closed_kline("TESTUSDT", gap)
+
+        task = engine.recovery_tasks.get("TESTUSDT")
+        assert task is not None
+        await task
+        assert calls == ["TESTUSDT"]
+        assert "TESTUSDT" not in engine.warmup_symbols
+        assert engine.totals["gap_history_recoveries"] == 1
+
+    asyncio.run(run())
