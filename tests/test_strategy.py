@@ -20,7 +20,7 @@ def base(n=79):
 def test_explosion_long():
     k = base()
     p = float(k[-1][4])
-    k.append(kl(p, p + 0.5, p - 0.02, p + 0.46, 250000, 79))
+    k.append(kl(p, p + 0.416, p - 0.104, p + 0.416, 250000, 79))
     ev = evaluate("TESTUSDT", k, cfg)
     assert ev.passed and ev.side == "LONG", (ev.reason, ev.m)
     assert ev.levels["sl"] < ev.levels["entry"] < ev.levels["tp1"] < ev.levels["tp2"]
@@ -29,7 +29,7 @@ def test_explosion_long():
 def test_explosion_short():
     k = base()
     p = float(k[-1][4])
-    k.append(kl(p, p + 0.02, p - 0.5, p - 0.46, 250000, 79))
+    k.append(kl(p, p + 0.104, p - 0.416, p - 0.416, 250000, 79))
     ev = evaluate("TESTUSDT", k, cfg)
     assert ev.passed and ev.side == "SHORT", (ev.reason, ev.m)
     assert ev.levels["tp2"] < ev.levels["tp1"] < ev.levels["entry"] < ev.levels["sl"]
@@ -37,7 +37,7 @@ def test_explosion_short():
 
 def test_rejects_low_volume():
     k = base(); p = float(k[-1][4])
-    k.append(kl(p, p + 0.5, p - 0.02, p + 0.46, 60000, 79))
+    k.append(kl(p, p + 0.416, p - 0.104, p + 0.416, 60000, 79))
     assert evaluate("T", k, cfg).reason == "volume"
 
 
@@ -49,9 +49,9 @@ def test_rejects_quiet():
 
 def test_rejects_late_entry():
     k = base(); p = float(k[-1][4])
-    k.append(kl(p, p + 0.5, p - 0.02, p + 0.46, 250000, 79))
-    p2 = p + 0.46
-    k.append(kl(p2, p2 + 0.5, p2 - 0.02, p2 + 0.46, 250000, 80))
+    k.append(kl(p, p + 0.416, p - 0.104, p + 0.416, 250000, 79))
+    p2 = p + 0.416
+    k.append(kl(p2, p2 + 0.416, p2 - 0.104, p2 + 0.416, 250000, 80))
     ev = evaluate("T", k, cfg)
     assert not ev.passed and ev.reason in ("late_entry", "overextended", "rsi"), ev.reason
 
