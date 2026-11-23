@@ -41,7 +41,7 @@ def test_closed_candle_signal_and_duplicate_guard():
     asyncio.run(run())
 
 
-def test_per_candle_batch_cap():
+def test_per_candle_has_no_alert_cap():
     async def run():
         cfg = load()
         symbols = ["AUSDT", "BUSDT", "CUSDT", "DUSDT"]
@@ -55,8 +55,9 @@ def test_per_candle_batch_cap():
         breakout = ts.kl(p, p + 0.416, p - 0.104, p + 0.312, 300000, 79)
         for symbol in symbols:
             await engine.on_closed_kline(symbol, breakout)
-        assert len(notifier.msgs) == cfg.max_per_scan == 3
-        assert engine.suppressed["scan_cap"] == 1
+        assert len(notifier.msgs) == len(symbols)
+        assert engine.suppressed["scan_cap"] == 0
+        assert engine.suppressed["hourly_cap"] == 0
     asyncio.run(run())
 
 
