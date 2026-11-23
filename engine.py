@@ -319,7 +319,7 @@ class Engine:
                       "avg_quote_volume>=": c.min_avg_qvol, "vol_x>=": c.vol_mult,
                       "body>=": c.min_body, "range_atr_soft_score_from": c.range_mult,
                       "range_atr_safety_max": c.max_range_atr,
-                      "close_location_soft_score_only": true,
+                      "close_location_soft_score_only": True,
                       "close_loc_score_reference": c.close_loc,
                       "rsi_soft_score_band": [c.rsi_min, c.rsi_max],
                       "breakout_extension_atr<=": c.max_ext_atr, "stop_atr<=": c.sl_atr,
