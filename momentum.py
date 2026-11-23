@@ -12,10 +12,7 @@ import math
 
 from indicators import atr, rsi
 
-GATES = (
-    "liquidity", "volume", "range", "max_range", "body",
-    "breakout", "late_entry", "extension",
-)
+GATES = ("liquidity", "volume", "body", "breakout")
 
 
 @dataclass
@@ -99,20 +96,30 @@ def evaluate(symbol, k, cfg) -> Eval:
         "extension_atr": round(extension_atr, 2),
     }
 
+    # Exactly four setup gates: liquidity, volume, strong candle body,
+    # and confirmed Donchian breakout. Timing/range checks below are safety
+    # controls rather than additional setup-confirmation requirements.
     checks = (
         avg_q >= cfg.min_avg_qvol,
         vol_x >= cfg.vol_mult,
-        range_atr >= cfg.range_mult,
-        range_atr <= cfg.max_range_atr,
-        body >= cfg.min_body and loc >= cfg.close_loc,
+        body >= cfg.min_body,
         broke,
-        not prev_broke,
-        extension_atr <= cfg.max_ext_atr,
     )
     for i, ok in enumerate(checks):
         if not ok:
             ev.reason, ev.depth = GATES[i], i
             return ev
+
+    # Independent safety controls remain active after the four setup gates.
+    if range_atr > cfg.max_range_atr:
+        ev.reason, ev.depth = "max_range", len(GATES)
+        return ev
+    if prev_broke:
+        ev.reason, ev.depth = "late_entry", len(GATES)
+        return ev
+    if extension_atr > cfg.max_ext_atr:
+        ev.reason, ev.depth = "extension", len(GATES)
+        return ev
 
     # Structural stop: must be outside the signal candle. If that stop is
     # wider than the configured ATR risk ceiling, reject instead of placing
