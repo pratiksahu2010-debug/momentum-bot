@@ -66,5 +66,5 @@ Tests cover strategy gates, closed-candle processing, duplicate suppression, Web
 ## Operational notes
 - Binance Spot market-data stream docs: https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md
 - Binance Spot kline REST docs: https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#klinecandlestick-data
-- Combined streams support up to 1024 streams per connection; this bot uses 120.
+- Combined streams support up to 1024 streams per connection; this bot uses 114 core symbols, with replacements validated at startup.
 - A Binance Spot WebSocket connection is valid for 24 hours; the bot rotates proactively.
