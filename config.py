@@ -47,8 +47,6 @@ class Config:
     rr1: float
     rr2: float
     cooldown_min: int
-    max_per_hour: int
-    max_per_scan: int
     min_score: float
 
 
@@ -82,8 +80,6 @@ def load() -> Config:
         rr1=_f("RR1", 1.5),
         rr2=_f("RR2", 3.0),
         cooldown_min=_i("COOLDOWN_MIN", 0),
-        max_per_hour=_i("MAX_PER_HOUR", 6),
-        max_per_scan=_i("MAX_PER_SCAN", 3),
         min_score=_f("MIN_SCORE", 48),
     )
     if cfg.port < 1 or cfg.port > 65535:
@@ -106,8 +102,8 @@ def load() -> Config:
         raise ValueError("MIN_AVG_QVOL cannot be negative")
     if cfg.sl_atr <= 0 or cfg.rr1 <= 0 or cfg.rr2 <= cfg.rr1:
         raise ValueError("SL_ATR and RR1 must be positive and RR2 must be greater than RR1")
-    if cfg.cooldown_min < 0 or cfg.max_per_hour < 1 or cfg.max_per_scan < 1:
-        raise ValueError("COOLDOWN_MIN cannot be negative and signal caps must be positive")
+    if cfg.cooldown_min < 0:
+        raise ValueError("COOLDOWN_MIN cannot be negative")
     if not 0 <= cfg.min_score <= 100:
         raise ValueError("MIN_SCORE must be between 0 and 100")
     return cfg
