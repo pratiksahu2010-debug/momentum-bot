@@ -68,6 +68,8 @@ class Engine:
         self.history_retry_after_at = None
         self.history_bootstrap_attempts = 0
         self.history_request_lock = asyncio.Lock()
+        self.history_semaphore = asyncio.Semaphore(HISTORY_CONCURRENCY)
+        self.recovery_tasks = {}
         self.history_last_request_at = 0.0
         self.history_last_candle_at = None
         self.last_scan = {}
@@ -221,7 +223,7 @@ class Engine:
             log.info("Historical bootstrap disabled; using WebSocket warm-up")
             return
 
-        semaphore = asyncio.Semaphore(HISTORY_CONCURRENCY)
+        semaphore = self.history_semaphore
         loaded_symbols = set()
         consecutive_failures = 0
         retry_base = 30
@@ -294,6 +296,46 @@ class Engine:
             # Defensive fallback; the loop normally continues until every symbol is seeded.
             log.warning("History bootstrap stopped with %d symbols still warming", self.bootstrap_failed_symbols)
 
+    def _schedule_symbol_recovery(self, symbol):
+        """Schedule one targeted REST repair for a symbol whose live candles had a gap."""
+        if (not self.bootstrap_enabled or self.session is None or
+                self.bootstrap_completed_at is None):
+            return
+        task = self.recovery_tasks.get(symbol)
+        if task is not None and not task.done():
+            return
+        self.recovery_tasks[symbol] = asyncio.create_task(self._recover_symbol_history(symbol))
+
+    async def _recover_symbol_history(self, symbol):
+        """Repair a post-bootstrap candle gap without waiting 50 new live candles."""
+        try:
+            for attempt in range(5):
+                if symbol not in self.warmup_symbols:
+                    return
+                loaded = await self._fetch_symbol_history(symbol, self.history_semaphore)
+                if loaded:
+                    self.totals["gap_history_recoveries"] += 1
+                    log.info("Recovered %s candle history after gap (%d candles)", symbol, len(self.buffers[symbol]))
+                    return
+                if self.history_rate_limited:
+                    wait = max(1, int((self.history_retry_after_at or (time.time() + 60)) - time.time()))
+                    log.warning("Gap recovery for %s paused by Binance rate limit for %ds", symbol, wait)
+                    await asyncio.sleep(wait)
+                    self.history_rate_limited = False
+                    self.history_retry_after_at = None
+                    self.history_last_request_at = 0.0
+                elif attempt < 4:
+                    await asyncio.sleep(min(300, 30 * (2 ** attempt)))
+            self.errors["gap_history_recovery_failed"] += 1
+            log.warning("Could not restore contiguous history for %s; WebSocket warm-up continues", symbol)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.errors["gap_history_recovery_errors"] += 1
+            log.warning("Gap history recovery error for %s: %s", symbol, str(exc)[:180])
+        finally:
+            self.recovery_tasks.pop(symbol, None)
+
     async def on_closed_kline(self, symbol, row):
         """Accept one Binance-format, CLOSED kline row; safe to call repeatedly."""
         if symbol not in self.buffers:
@@ -312,6 +354,7 @@ class Engine:
                 self.totals["missed_intervals"] += max(1, (open_time - expected_open) // interval_ms)
                 candles.clear()
                 self.warmup_symbols.add(symbol)
+                self._schedule_symbol_recovery(symbol)
                 self.last_eval[symbol] = {
                     "at": iso(time.time()), "passed": False, "reason": "candle_gap_warmup",
                     "depth": 0, "side": "-", "score": 0, "metrics": {},
