@@ -8,7 +8,9 @@ Signal-only Telegram bot. It scans a core universe of liquid Binance Spot USDT p
 - After universe validation, the bot makes a **one-time historical bootstrap** using Binance Spot `GET /api/v3/klines`: it requests enough recent candles for each symbol to seed the existing indicator history. This is a finite startup snapshot, not polling.
 - Only fully closed candles are accepted from REST or WebSocket. Historical candles seed buffers only; they are never evaluated or sent as backdated alerts.
 - After bootstrap, all live updates and strategy evaluations come from the WebSocket. The bot does not run periodic REST market-data polling.
-- If a REST request fails or a symbol has insufficient contiguous history, that symbol stays in WebSocket warm-up. Bootstrap failures do not stop the bot.
+- If a REST request fails or a symbol has insufficient contiguous history, that symbol stays in WebSocket warm-up. Bootstrap now retries only missing symbols with progressive backoff; 418/429 responses pause until Binance's Retry-After expires. The live WebSocket is never blocked by bootstrap.
+- After initial bootstrap completes, a detected candle gap triggers one targeted history repair for that symbol. It does not force the symbol to collect 50 new candles if REST history can safely restore the contiguous buffer.
+- The health endpoint reports bootstrap retry state, gap-recovery tasks, and Telegram delivery counters (attempts, successes, failures, rate limits, and last error).
 - The combined connection is rotated before Binance's documented 24-hour connection lifetime. Automatic reconnect uses exponential backoff (1–60 seconds), and aiohttp handles server ping/pong frames.
 - Duplicate candle-open timestamps are ignored. Candle gaps clear that symbol's buffer rather than calculating indicators across missing data.
 
@@ -59,7 +61,7 @@ For Render Free, configure an external cron monitor to GET `https://momentum-bot
 python -m pytest -q
 ```
 
-Tests cover strategy gates, closed-candle processing, duplicate suppression, WebSocket open-candle rejection, candle-gap resets, and REST history seeding (including ignoring the current unfinished candle).
+Tests cover strategy gates, closed-candle processing, duplicate suppression, WebSocket open-candle rejection, candle-gap resets and targeted recovery, retrying only missing bootstrap symbols, and REST history seeding (including ignoring the current unfinished candle).
 
 ## Operational notes
 - Binance Spot market-data stream docs: https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md
