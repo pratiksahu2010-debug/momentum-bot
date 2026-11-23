@@ -14,7 +14,7 @@ from notifier import format_signal
 log = logging.getLogger("engine")
 RECONNECT_MAX_SECONDS = 60
 CONNECTION_ROTATE_SECONDS = 23 * 60 * 60 + 50 * 60
-BATCH_WINDOW_SECONDS = 5
+BATCH_WINDOW_SECONDS = 10
 HISTORY_REQUEST_LIMIT = 100
 HISTORY_CONCURRENCY = 8
 HISTORY_RETRIES = 3
@@ -49,6 +49,8 @@ class Engine:
         self.suppressed, self.errors = Counter(), Counter()
         self.pending_batches = {}
         self.batch_tasks = {}
+        self.flushed_batch_order = deque(maxlen=32)
+        self.flushed_batch_set = set()
         self.started = time.time()
         self.connected = False
         self.connection_count = 0
@@ -247,14 +249,32 @@ class Engine:
         ev = evaluate(symbol, list(candles), self.cfg)
         self.last_eval[symbol] = ev.as_dict(iso(time.time()))
 
+        # If this symbol's candle arrives after its batch was finalized, still
+        # evaluate and dispatch it independently. Never create a second scan
+        # for the same candle or silently drop a late qualified candidate.
+        if open_time in self.flushed_batch_set:
+            self.totals["late_candle_arrivals"] += 1
+            self.totals["evaluated"] += 1
+            if ev.passed:
+                self.totals["qualified"] += 1
+                sent, suppressed = await self._dispatch([ev], time.time(), {symbol} if warming else set())
+                self.totals["sent"] += sent
+                self.suppressed.update(suppressed)
+            else:
+                self.rejected[ev.reason] += 1
+            self.last_scan["late_arrivals"] = self.last_scan.get("late_arrivals", 0) + 1
+            return
+
         batch = self.pending_batches.get(open_time)
         if batch is None:
             batch = {
                 "started": time.time(), "processed": 0, "evaluated": 0,
                 "candidates": [], "rejected": Counter(), "warmup_symbols": set(),
+                "symbols_seen": set(),
             }
             self.pending_batches[open_time] = batch
             self.batch_tasks[open_time] = asyncio.create_task(self._flush_after(open_time))
+        batch["symbols_seen"].add(symbol)
         batch["processed"] += 1
         batch["evaluated"] += 1
         if ev.passed:
@@ -297,11 +317,22 @@ class Engine:
         self.totals["sent"] += sent
         self.rejected.update(rejected)
         self.suppressed.update(suppressed)
+        missing_symbols = sorted(set(self.symbols) - batch["symbols_seen"])
+        self.flushed_batch_order.append(open_time)
+        self.flushed_batch_set.add(open_time)
+        while len(self.flushed_batch_set) > self.flushed_batch_order.maxlen:
+            oldest = self.flushed_batch_order.popleft()
+            self.flushed_batch_set.discard(oldest)
+        coverage = 100.0 * batch["evaluated"] / len(self.symbols)
         self.last_scan = {
             "at": iso(now), "ts": now, "candle_open": open_time,
             "duration_s": round(now - batch["started"], 2),
-            "evaluated": batch["evaluated"], "qualified": len(candidates),
-            "sent": sent, "rejected": dict(rejected), "suppressed": dict(suppressed), "errors": {},
+            "evaluated": batch["evaluated"], "expected": len(self.symbols),
+            "coverage_pct": round(coverage, 1),
+            "missing_count": len(missing_symbols), "missing_symbols": missing_symbols,
+            "late_arrivals": 0,
+            "qualified": len(candidates), "sent": sent,
+            "rejected": dict(rejected), "suppressed": dict(suppressed), "errors": {},
         }
         log.info("closed-candle batch eval=%d qualified=%d sent=%d rejected=%s suppressed=%s",
                  batch["evaluated"], len(candidates), sent, dict(rejected), dict(suppressed))
@@ -480,6 +511,14 @@ class Engine:
         near.sort(key=lambda item: (-item[1]["depth"], -item[1].get("metrics", {}).get("vol_x", 0)))
         return {
             "last_scan": self.last_scan.get("at"),
+            "scan_coverage": {
+                "evaluated": self.last_scan.get("evaluated", 0),
+                "expected": self.last_scan.get("expected", len(self.symbols)),
+                "coverage_pct": self.last_scan.get("coverage_pct", 0),
+                "missing_symbols": self.last_scan.get("missing_symbols", []),
+                "late_arrivals": self.last_scan.get("late_arrivals", 0),
+                "batch_window_seconds": BATCH_WINDOW_SECONDS,
+            },
             "by_reason": {reason: {"count": len(symbols), "symbols": sorted(symbols)}
                           for reason, symbols in by_reason.items()},
             "near_misses": [{"symbol": symbol, "failed_gate": result["reason"],
