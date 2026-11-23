@@ -31,7 +31,7 @@ def test_closed_candle_signal_and_duplicate_guard():
             await engine.on_closed_kline("TESTUSDT", candle)
         assert engine.summary()["symbols_ready"] == 1
         p = float(ts.base()[-1][4])
-        breakout = ts.kl(p, p + 0.416, p - 0.104, p + 0.312, 250000, 79)
+        breakout = ts.kl(p, p + 0.416, p - 0.104, p + 0.312, 300000, 79)
         await engine.on_closed_kline("TESTUSDT", breakout)
         assert len(notifier.msgs) == 1, engine.last_eval["TESTUSDT"]
         assert "MOMENTUM EXPLOSION" in notifier.msgs[0]
@@ -52,7 +52,7 @@ def test_per_candle_batch_cap():
             for symbol in symbols:
                 await engine.on_closed_kline(symbol, candle)
         p = float(history[-1][4])
-        breakout = ts.kl(p, p + 0.416, p - 0.104, p + 0.312, 250000, 79)
+        breakout = ts.kl(p, p + 0.416, p - 0.104, p + 0.312, 300000, 79)
         for symbol in symbols:
             await engine.on_closed_kline(symbol, breakout)
         assert len(notifier.msgs) == cfg.max_per_scan == 3
