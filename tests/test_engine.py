@@ -206,6 +206,8 @@ def test_post_bootstrap_candle_gap_schedules_targeted_history_recovery(monkeypat
             # Simulate REST returning the contiguous closed history, including
             # the latest live candle, without evaluating any historical signal.
             rows = ts.base()
+            p0 = float(rows[-1][4])
+            rows.append(ts.kl(p0, p0 + 0.10, p0 - 0.10, p0 + 0.02, 50000, 79))
             engine._seed_history(symbol, rows, now_ms=int(rows[-1][6]) + 1)
             return symbol not in engine.warmup_symbols
 
