@@ -60,7 +60,7 @@ def load() -> Config:
         interval=interval,
         interval_seconds=INTERVAL_SECONDS[interval],
         ws_url=os.getenv("BINANCE_WS_URL", "wss://stream.binance.com:443").rstrip("/"),
-        rest_url=os.getenv("BINANCE_REST_URL", "https://api.binance.com").rstrip("/"),
+        rest_url=os.getenv("BINANCE_REST_URL", "https://data-api.binance.vision").rstrip("/"),
         history_bootstrap=_b("HISTORY_BOOTSTRAP", True),
         port=_i("PORT", 10000),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
