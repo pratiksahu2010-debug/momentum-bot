@@ -65,6 +65,8 @@ class Engine:
         self.bootstrap_failed_symbols = 0
         self.bootstrap_enabled = cfg.history_bootstrap
         self.history_rate_limited = False
+        self.history_retry_after_at = None
+        self.history_bootstrap_attempts = 0
         self.history_request_lock = asyncio.Lock()
         self.history_last_request_at = 0.0
         self.history_last_candle_at = None
@@ -186,6 +188,12 @@ class Engine:
                             # must not wait for REST recovery.
                             self.history_rate_limited = True
                             retry_after = response.headers.get("Retry-After")
+                            try:
+                                retry_seconds = max(1, int(float(retry_after))) if retry_after else 60
+                            except (TypeError, ValueError, OverflowError):
+                                retry_seconds = 60
+                            retry_at = time.time() + retry_seconds
+                            self.history_retry_after_at = max(self.history_retry_after_at or 0, retry_at)
                             log.warning(
                                 "Binance REST history rate-limited (%s, Retry-After=%s); "
                                 "aborting remaining bootstrap requests and continuing WebSocket-only",
@@ -207,37 +215,60 @@ class Engine:
         return False
 
     async def bootstrap_history(self):
-        """Fetch a one-time REST history snapshot; live market data remains WebSocket-only."""
+        """Fetch historical candles; on 418/429 wait for Retry-After before one paced retry."""
         if not self.bootstrap_enabled:
             log.info("Historical bootstrap disabled; using WebSocket warm-up")
             return
         if self.bootstrap_completed_at is not None:
             return
-        self.bootstrap_started_at = time.time()
-        log.info(
-            "Starting one-time Binance REST history bootstrap: %d symbols, %d closed candles each, concurrency=%d",
-            len(self.symbols), self.required_history, HISTORY_CONCURRENCY,
-        )
+
         semaphore = asyncio.Semaphore(HISTORY_CONCURRENCY)
-        results = await asyncio.gather(
-            *(self._fetch_symbol_history(symbol, semaphore) for symbol in self.symbols),
-            return_exceptions=True,
-        )
-        loaded = 0
-        for symbol, result in zip(self.symbols, results):
-            if result is True:
-                loaded += 1
-            elif isinstance(result, Exception):
-                self.errors["history_unhandled_errors"] += 1
-                log.warning("History bootstrap exception for %s: %s", symbol, str(result)[:180])
-        self.bootstrap_loaded_symbols = loaded
-        self.bootstrap_failed_symbols = len(self.symbols) - loaded
+        loaded_symbols = set()
+        while True:
+            self.bootstrap_started_at = self.bootstrap_started_at or time.time()
+            self.history_bootstrap_attempts += 1
+            log.info(
+                "Starting Binance history bootstrap attempt %d: %d symbols, %d closed candles each",
+                self.history_bootstrap_attempts, len(self.symbols), self.required_history,
+            )
+            results = await asyncio.gather(
+                *(self._fetch_symbol_history(symbol, semaphore) for symbol in self.symbols
+                  if symbol not in loaded_symbols),
+                return_exceptions=True,
+            )
+            pending_symbols = [s for s in self.symbols if s not in loaded_symbols]
+            for symbol, result in zip(pending_symbols, results):
+                if result is True:
+                    loaded_symbols.add(symbol)
+                elif isinstance(result, Exception):
+                    self.errors["history_unhandled_errors"] += 1
+                    log.warning("History bootstrap exception for %s: %s", symbol, str(result)[:180])
+
+            self.bootstrap_loaded_symbols = len(loaded_symbols)
+            self.bootstrap_failed_symbols = len(self.symbols) - len(loaded_symbols)
+            self.totals["history_bootstrap_loaded_symbols"] = self.bootstrap_loaded_symbols
+            self.totals["history_bootstrap_failed_symbols"] = self.bootstrap_failed_symbols
+
+            if not self.history_rate_limited:
+                break
+
+            # Honor Binance's Retry-After instead of retrying the banned IP.
+            # The live WebSocket continues collecting candles while this task sleeps.
+            wait_seconds = max(1, int((self.history_retry_after_at or (time.time() + 60)) - time.time()))
+            log.warning(
+                "Historical bootstrap paused by Binance rate limit; retrying once the cooldown expires in %ds",
+                wait_seconds,
+            )
+            await asyncio.sleep(wait_seconds)
+            self.history_rate_limited = False
+            self.history_retry_after_at = None
+            self.history_last_request_at = 0.0
+
         self.bootstrap_completed_at = time.time()
-        self.totals["history_bootstrap_loaded_symbols"] = loaded
-        self.totals["history_bootstrap_failed_symbols"] = self.bootstrap_failed_symbols
         log.info(
-            "History bootstrap completed: loaded=%d/%d still_warming=%d rate_limited=%s; WebSocket remains live source",
-            loaded, len(self.symbols), len(self.warmup_symbols), self.history_rate_limited,
+            "History bootstrap completed: loaded=%d/%d still_warming=%d attempts=%d; WebSocket remains live source",
+            self.bootstrap_loaded_symbols, len(self.symbols), len(self.warmup_symbols),
+            self.history_bootstrap_attempts,
         )
 
     async def on_closed_kline(self, symbol, row):
@@ -512,6 +543,8 @@ class Engine:
             "strategy_ready": not self.warmup_symbols and self.connected and self.status() == "ok",
             "history_bootstrap_enabled": self.bootstrap_enabled,
             "history_rate_limited": self.history_rate_limited,
+            "history_retry_after_at": iso(self.history_retry_after_at) if self.history_retry_after_at else None,
+            "history_bootstrap_attempts": self.history_bootstrap_attempts,
             "history_bootstrap_started_at": iso(self.bootstrap_started_at) if self.bootstrap_started_at else None,
             "history_bootstrap_completed_at": iso(self.bootstrap_completed_at) if self.bootstrap_completed_at else None,
             "history_bootstrap_loaded_symbols": self.bootstrap_loaded_symbols,
