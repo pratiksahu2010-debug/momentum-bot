@@ -275,7 +275,7 @@ class Engine:
                     self.bootstrap_failed_symbols, wait_seconds,
                 )
             else:
-                wait_seconds = min(retry_cap, retry_base * (2 ** min(consecutive_failures - 1, 5)))
+                wait_seconds = min(retry_cap, retry_base * (2 ** max(0, min(consecutive_failures - 1, 5))))
                 log.warning(
                     "History bootstrap incomplete: %d/%d loaded; retrying only missing symbols in %ds",
                     self.bootstrap_loaded_symbols, len(self.symbols), wait_seconds,
