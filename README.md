@@ -35,7 +35,7 @@ The following are deliberately **not additional setup gates**:
 
 Independent safety controls remain active after the four gates: maximum candle range (5 ATR), reject a breakout already confirmed on the previous candle, maximum breakout extension (3.5 ATR), and structural stop validation (stop must remain beyond the signal candle and within the 1.8 ATR risk ceiling). These controls can still reject an unsafe or late setup.
 
-The minimum score remains 48/100. Cooldown is 0 minutes; alert caps remain six per hour and three per scan. This is a signal-only system and does not execute orders.
+The minimum score remains 48/100. Cooldown is 0 minutes. Hourly and per-scan alert-count caps are removed; every qualified candidate can be sent, subject to the strategy gates, safety checks, score threshold, and per-symbol cooldown. This is a signal-only system and does not execute orders.
 
 ## Health endpoints
 - `/ping`: empty-body HTTP 200 for an external cron/uptime monitor.
