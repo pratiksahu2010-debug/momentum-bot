@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import Counter, deque
 from datetime import datetime, timezone
@@ -25,6 +26,13 @@ class Engine:
 
     def __init__(self, cfg, session, notifier, symbols):
         self.cfg, self.session, self.notifier, self.symbols = cfg, session, notifier, list(symbols)
+        if not self.symbols or len(self.symbols) > 1024:
+            raise ValueError("Symbol universe must contain 1..1024 symbols")
+        if len(set(self.symbols)) != len(self.symbols):
+            raise ValueError("Symbol universe contains duplicates")
+        invalid = [s for s in self.symbols if not re.fullmatch(r"[A-Z0-9]{2,20}USDT", s)]
+        if invalid:
+            raise ValueError(f"Invalid Binance USDT symbol format: {invalid[:10]}")
         self.required_history = max(50, cfg.lookback + 16)
         self.history_size = max(80, self.required_history)
         self.buffers = {s: deque(maxlen=self.history_size) for s in self.symbols}
@@ -58,11 +66,25 @@ class Engine:
         if symbol not in self.buffers:
             return
         open_time = int(row[0])
-        if open_time <= self.last_seen.get(symbol, -1):
+        previous_open = self.last_seen.get(symbol)
+        if previous_open is not None and open_time <= previous_open:
             self.totals["duplicate_candles"] += 1
             return
-        self.last_seen[symbol] = open_time
         candles = self.buffers[symbol]
+        if previous_open is not None:
+            interval_ms = self.cfg.interval_seconds * 1000
+            expected_open = previous_open + interval_ms
+            if open_time != expected_open:
+                # Discard discontinuous history: never calculate indicators across missing candles.
+                self.totals["candle_gaps"] += 1
+                self.totals["missed_intervals"] += max(1, (open_time - expected_open) // interval_ms + 1)
+                candles.clear()
+                self.warmup_symbols.add(symbol)
+                self.last_eval[symbol] = {
+                    "at": iso(time.time()), "passed": False, "reason": "candle_gap_warmup",
+                    "depth": 0, "side": "-", "score": 0, "metrics": {},
+                }
+        self.last_seen[symbol] = open_time
         candles.append(row)
         self.last_kline_at = time.time()
 
@@ -198,7 +220,13 @@ class Engine:
         except (TypeError, json.JSONDecodeError):
             self.errors["invalid_json"] += 1
             return
+        if isinstance(envelope, dict) and "code" in envelope and "msg" in envelope:
+            self.errors["binance_stream_errors"] += 1
+            raise ConnectionError(f"Binance stream error {envelope.get('code')}: {envelope.get('msg')}")
         data = envelope.get("data", envelope)
+        if not isinstance(data, dict):
+            self.errors["invalid_message"] += 1
+            return
         if data.get("e") == "serverShutdown":
             raise ConnectionError("Binance announced WebSocket server shutdown")
         if data.get("e") != "kline":
@@ -287,9 +315,11 @@ class Engine:
             "suppressed": dict(self.suppressed),
             "stream_errors": dict(self.errors),
             "signals_last_hour": len(self.sent_times),
-            "rules": {"vol_x>=": c.vol_mult, "range_atr>=": c.range_mult, "body>=": c.min_body,
-                      "close_loc>=": c.close_loc, "rsi": [c.rsi_min, c.rsi_max],
-                      "max_ext_atr": c.max_ext_atr, "cooldown_min": c.cooldown_min,
+            "rules": {"vol_x>=": c.vol_mult, "range_atr>=": c.range_mult,
+                      "range_atr<=": c.max_range_atr, "body>=": c.min_body,
+                      "close_loc>=": c.close_loc, "rsi_soft_score_band": [c.rsi_min, c.rsi_max],
+                      "breakout_extension_atr<=": c.max_ext_atr, "stop_atr<=": c.sl_atr,
+                      "cooldown_min": c.cooldown_min,
                       "max_per_hour": c.max_per_hour, "max_per_scan": c.max_per_scan,
                       "min_score": c.min_score},
             "endpoints": ["/ping", "/health", "/health/qualified", "/health/rejections", "/health/symbol/BTCUSDT"],
