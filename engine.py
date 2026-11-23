@@ -77,7 +77,7 @@ class Engine:
             if open_time != expected_open:
                 # Discard discontinuous history: never calculate indicators across missing candles.
                 self.totals["candle_gaps"] += 1
-                self.totals["missed_intervals"] += max(1, (open_time - expected_open) // interval_ms + 1)
+                self.totals["missed_intervals"] += max(1, (open_time - expected_open) // interval_ms)
                 candles.clear()
                 self.warmup_symbols.add(symbol)
                 self.last_eval[symbol] = {
