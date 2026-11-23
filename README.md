@@ -3,14 +3,20 @@
 Signal-only Telegram bot. It scans the same fixed universe of 120 Binance Spot USDT pairs and preserves the existing momentum strategy. It does not place orders.
 
 ## Market-data architecture
-- **WebSocket only for market data.** One Binance combined-stream connection subscribes to all 120 `<symbol>@kline_5m` streams (or the interval selected by `INTERVAL`).
-- Only candles with Binance's `k.x == true` (closed candle) are evaluated. Partial candles are ignored.
-- The bot makes **no Binance REST market-data requests**. The earlier REST polling path that triggered HTTP 418/429 is removed.
+- **Live market data uses one Binance combined WebSocket connection** for all 120 `<symbol>@kline_5m` streams (or the interval selected by `INTERVAL`).
+- At startup, the bot makes a **one-time historical bootstrap** using Binance Spot `GET /api/v3/klines`: it requests enough recent candles for each symbol to seed the existing indicator history. This is a finite startup snapshot, not polling.
+- Only fully closed candles are accepted from REST or WebSocket. Historical candles seed buffers only; they are never evaluated or sent as backdated alerts.
+- After bootstrap, all live updates and strategy evaluations come from the WebSocket. The bot does not run periodic REST market-data polling.
+- If a REST request fails or a symbol has insufficient contiguous history, that symbol stays in WebSocket warm-up. Bootstrap failures do not stop the bot.
 - The combined connection is rotated before Binance's documented 24-hour connection lifetime. Automatic reconnect uses exponential backoff (1–60 seconds), and aiohttp handles server ping/pong frames.
-- Duplicate candle-open timestamps are ignored. A single in-memory rolling history is maintained per symbol.
+- Duplicate candle-open timestamps are ignored. Candle gaps clear that symbol's buffer rather than calculating indicators across missing data.
 
-## Startup warm-up
-WebSocket-only means there is no REST candle-history download. Each symbol needs `max(50, LOOKBACK + 16)` closed candles before its existing indicators can be evaluated. With the default 5-minute interval and 50-candle minimum, allow approximately **4 hours 10 minutes** after a fresh process start before all symbols are ready. A symbol is evaluated after its history is ready; no strategy thresholds or indicator calculations are changed. The first qualified candidate for each symbol during warm-up is suppressed, matching the existing warm-up safety behavior.
+## Startup history bootstrap
+- Default: `HISTORY_BOOTSTRAP=true`; set it to `false` to return to WebSocket-only warm-up.
+- REST base URL: `BINANCE_REST_URL` (default `https://api.binance.com`).
+- The bot requests up to 60 recent klines per symbol, with bounded concurrency (8), short request timeouts, and limited retries for rate limits/transient server errors.
+- Each symbol needs `max(50, LOOKBACK + 16)` contiguous closed candles. With the default 5-minute interval, a successful bootstrap normally makes all 120 symbols strategy-ready shortly after the WebSocket begins delivering fresh closed candles.
+- Health reports bootstrap loaded/failed counts separately from live WebSocket candle timestamps.
 
 ## Balanced four-gate momentum strategy
 Exactly **four setup conditions** are mandatory. LONG and SHORT use mirrored breakout logic.
@@ -34,7 +40,7 @@ The minimum score remains 48/100. Cooldown is 0 minutes; alert caps remain six p
 ## Health endpoints
 - `/ping`: empty-body HTTP 200 for an external cron/uptime monitor.
 - `/`: plain `ok`.
-- `/health`: WebSocket connection, reconnect, warm-up, strategy and alert status.
+- `/health`: WebSocket connection, reconnect, warm-up, one-time bootstrap, strategy and alert status.
 - `/health/qualified`, `/health/rejections`, `/health/symbol/BTCUSDT`: diagnostics.
 
 For Render Free, configure an external cron monitor to GET `https://momentum-bot-fwdp.onrender.com/ping` every 5 minutes. Do not rely on an internal self-ping task.
@@ -43,18 +49,18 @@ For Render Free, configure an external cron monitor to GET `https://momentum-bot
 - Build command: `pip install -r requirements.txt`
 - Start command: `python main.py`
 - Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+- Optional: `HISTORY_BOOTSTRAP=true`, `BINANCE_REST_URL=https://api.binance.com`.
 - Python 3.11.9 is specified in `render.yaml`.
 
 ## Tests
 ```bash
-python tests/test_strategy.py
-python tests/test_engine.py
+python -m pytest -q
 ```
 
-The strategy tests exercise the original evaluator. Engine tests cover closed-candle processing, duplicate suppression and ignoring open candles.
+Tests cover strategy gates, closed-candle processing, duplicate suppression, WebSocket open-candle rejection, candle-gap resets, and REST history seeding (including ignoring the current unfinished candle).
 
 ## Operational notes
 - Binance Spot market-data stream docs: https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md
+- Binance Spot kline REST docs: https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#klinecandlestick-data
 - Combined streams support up to 1024 streams per connection; this bot uses 120.
 - A Binance Spot WebSocket connection is valid for 24 hours; the bot rotates proactively.
-- WebSocket-only startup trades the convenience of immediate history for eliminating REST market-data polling. If the process restarts, in-memory candle history must be rebuilt.

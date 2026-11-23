@@ -15,6 +15,9 @@ log = logging.getLogger("engine")
 RECONNECT_MAX_SECONDS = 60
 CONNECTION_ROTATE_SECONDS = 23 * 60 * 60 + 50 * 60
 BATCH_WINDOW_SECONDS = 5
+HISTORY_REQUEST_LIMIT = 100
+HISTORY_CONCURRENCY = 8
+HISTORY_RETRIES = 3
 
 
 def iso(ts):
@@ -22,7 +25,7 @@ def iso(ts):
 
 
 class Engine:
-    """Binance Spot combined-WebSocket consumer; strategy evaluation is unchanged."""
+    """Binance Spot combined-WebSocket consumer with one-time REST history bootstrap."""
 
     def __init__(self, cfg, session, notifier, symbols):
         self.cfg, self.session, self.notifier, self.symbols = cfg, session, notifier, list(symbols)
@@ -53,13 +56,155 @@ class Engine:
         self.reconnects = 0
         self.last_message_at = None
         self.last_kline_at = None
-        self.last_scan = {}
         self.last_disconnect = None
+        self.bootstrap_started_at = None
+        self.bootstrap_completed_at = None
+        self.bootstrap_loaded_symbols = 0
+        self.bootstrap_failed_symbols = 0
+        self.bootstrap_enabled = cfg.history_bootstrap
+        self.history_last_candle_at = None
+        self.last_scan = {}
         self.stream_url = self._build_stream_url()
 
     def _build_stream_url(self):
         streams = "/".join(f"{symbol.lower()}@kline_{self.cfg.interval}" for symbol in self.symbols)
         return f"{self.cfg.ws_url.rstrip('/')}/stream?streams={streams}"
+
+    def _seed_history(self, symbol, rows, now_ms=None):
+        """Seed only the latest contiguous, fully closed REST candles. Never evaluates them."""
+        if symbol not in self.buffers or not isinstance(rows, list):
+            return False
+        now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        interval_ms = self.cfg.interval_seconds * 1000
+        clean = []
+        seen = set()
+        for row in rows:
+            try:
+                if not isinstance(row, (list, tuple)) or len(row) < 8:
+                    continue
+                open_time = int(row[0])
+                close_time = int(row[6])
+                values = [float(row[i]) for i in (1, 2, 3, 4, 7)]
+                if close_time >= now_ms or open_time in seen:
+                    continue
+                o, h, low, c, q = values
+                if not all(map(lambda v: v >= 0 and v < float("inf"), values)):
+                    continue
+                if min(o, h, low, c) <= 0 or h < max(o, c, low) or low > min(o, c):
+                    continue
+                seen.add(open_time)
+                clean.append([
+                    open_time, str(row[1]), str(row[2]), str(row[3]),
+                    str(row[4]), str(row[5]), close_time, str(row[7]),
+                ])
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+
+        clean.sort(key=lambda candle: candle[0])
+        # Retain only the latest uninterrupted segment; indicator windows must not
+        # bridge a missing market-data interval.
+        contiguous = []
+        for candle in clean:
+            if contiguous and candle[0] != contiguous[-1][0] + interval_ms:
+                contiguous = []
+            contiguous.append(candle)
+        if len(contiguous) < self.required_history:
+            return False
+
+        selected = contiguous[-self.history_size:]
+        self.buffers[symbol].clear()
+        self.buffers[symbol].extend(selected)
+        self.last_seen[symbol] = selected[-1][0]
+        self.warmup_symbols.discard(symbol)
+        self.last_eval[symbol] = {
+            "at": iso(time.time()), "passed": False, "reason": "history_seeded_waiting_for_live_candle",
+            "depth": 0, "side": "-", "score": 0, "metrics": {},
+        }
+        self.history_last_candle_at = max(
+            self.history_last_candle_at or 0, selected[-1][6] / 1000
+        )
+        self.totals["history_candles_loaded"] += len(selected)
+        self.totals["symbols_bootstrapped"] += 1
+        return True
+
+    async def _fetch_symbol_history(self, symbol, semaphore):
+        if self.session is None:
+            return False
+        url = f"{self.cfg.rest_url.rstrip('/')}/api/v3/klines"
+        params = {
+            "symbol": symbol,
+            "interval": self.cfg.interval,
+            "limit": min(HISTORY_REQUEST_LIMIT, self.required_history + 10),
+        }
+        async with semaphore:
+            for attempt in range(HISTORY_RETRIES):
+                try:
+                    timeout = aiohttp.ClientTimeout(total=15, connect=8, sock_read=10)
+                    async with self.session.get(url, params=params, timeout=timeout) as response:
+                        if response.status == 200:
+                            rows = await response.json()
+                            loaded = self._seed_history(symbol, rows)
+                            if not loaded:
+                                self.errors["history_insufficient_or_invalid"] += 1
+                            return loaded
+                        if response.status in (418, 429):
+                            self.errors[f"history_http_{response.status}"] += 1
+                            retry_after = response.headers.get("Retry-After", "1")
+                            try:
+                                delay = min(10.0, max(1.0, float(retry_after)))
+                            except (TypeError, ValueError):
+                                delay = 1.0
+                            if attempt + 1 < HISTORY_RETRIES:
+                                await asyncio.sleep(delay)
+                                continue
+                            return False
+                        self.errors[f"history_http_{response.status}"] += 1
+                        if response.status >= 500 and attempt + 1 < HISTORY_RETRIES:
+                            await asyncio.sleep(0.5 * (2 ** attempt))
+                            continue
+                        return False
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    self.errors["history_request_errors"] += 1
+                    if attempt + 1 < HISTORY_RETRIES:
+                        await asyncio.sleep(0.5 * (2 ** attempt))
+                    else:
+                        log.warning("History bootstrap failed for %s: %s", symbol, str(exc)[:180])
+                        return False
+        return False
+
+    async def bootstrap_history(self):
+        """Fetch a one-time REST history snapshot; live market data remains WebSocket-only."""
+        if not self.bootstrap_enabled:
+            log.info("Historical bootstrap disabled; using WebSocket warm-up")
+            return
+        if self.bootstrap_completed_at is not None:
+            return
+        self.bootstrap_started_at = time.time()
+        log.info(
+            "Starting one-time Binance REST history bootstrap: %d symbols, %d closed candles each, concurrency=%d",
+            len(self.symbols), self.required_history, HISTORY_CONCURRENCY,
+        )
+        semaphore = asyncio.Semaphore(HISTORY_CONCURRENCY)
+        results = await asyncio.gather(
+            *(self._fetch_symbol_history(symbol, semaphore) for symbol in self.symbols),
+            return_exceptions=True,
+        )
+        loaded = 0
+        for symbol, result in zip(self.symbols, results):
+            if result is True:
+                loaded += 1
+            elif isinstance(result, Exception):
+                self.errors["history_unhandled_errors"] += 1
+                log.warning("History bootstrap exception for %s: %s", symbol, str(result)[:180])
+        self.bootstrap_loaded_symbols = loaded
+        self.bootstrap_failed_symbols = len(self.symbols) - loaded
+        self.bootstrap_completed_at = time.time()
+        self.totals["history_bootstrap_loaded_symbols"] = loaded
+        self.totals["history_bootstrap_failed_symbols"] = self.bootstrap_failed_symbols
+        log.info(
+            "History bootstrap completed: loaded=%d/%d still_warming=%d; WebSocket remains live source",
+            loaded, len(self.symbols), len(self.warmup_symbols),
+        )
 
     async def on_closed_kline(self, symbol, row):
         """Accept one Binance-format, CLOSED kline row; safe to call repeatedly."""
@@ -75,7 +220,6 @@ class Engine:
             interval_ms = self.cfg.interval_seconds * 1000
             expected_open = previous_open + interval_ms
             if open_time != expected_open:
-                # Discard discontinuous history: never calculate indicators across missing candles.
                 self.totals["candle_gaps"] += 1
                 self.totals["missed_intervals"] += max(1, (open_time - expected_open) // interval_ms)
                 candles.clear()
@@ -104,8 +248,6 @@ class Engine:
         ev = evaluate(symbol, list(candles), self.cfg)
         self.last_eval[symbol] = ev.as_dict(iso(time.time()))
 
-        # Batch the symbols closing the same 5-minute candle. This preserves the
-        # original max_per_scan cap and best-score-first ordering with streaming data.
         batch = self.pending_batches.get(open_time)
         if batch is None:
             batch = {
@@ -232,7 +374,7 @@ class Engine:
         if data.get("e") != "kline":
             return
         k = data.get("k") or {}
-        if not k.get("x"):  # strategy always evaluates completed candles only
+        if not k.get("x"):
             return
         symbol = str(k.get("s") or data.get("s") or "").upper()
         if symbol not in self.buffers:
@@ -264,6 +406,9 @@ class Engine:
             log.info("Rotating Binance WebSocket connection before its 24-hour limit")
 
     async def run(self):
+        # Seed history once before the live socket starts. Failures are non-fatal:
+        # remaining symbols continue warming from WebSocket closed candles.
+        await self.bootstrap_history()
         delay = 1
         while True:
             try:
@@ -291,6 +436,7 @@ class Engine:
 
     def summary(self):
         c = self.cfg
+        ready = len(self.symbols) - len(self.warmup_symbols)
         return {
             "status": self.status(),
             "uptime_s": int(time.time() - self.started),
@@ -305,9 +451,16 @@ class Engine:
             "last_kline_at": iso(self.last_kline_at) if self.last_kline_at else None,
             "last_disconnect": self.last_disconnect,
             "symbols_total": len(self.symbols),
-            "symbols_ready": len(self.symbols) - len(self.warmup_symbols),
+            "symbols_ready": ready,
             "symbols_warming": sorted(self.warmup_symbols),
             "warmup_done": not self.warmup_symbols,
+            "strategy_ready": not self.warmup_symbols and self.connected and self.status() == "ok",
+            "history_bootstrap_enabled": self.bootstrap_enabled,
+            "history_bootstrap_started_at": iso(self.bootstrap_started_at) if self.bootstrap_started_at else None,
+            "history_bootstrap_completed_at": iso(self.bootstrap_completed_at) if self.bootstrap_completed_at else None,
+            "history_bootstrap_loaded_symbols": self.bootstrap_loaded_symbols,
+            "history_bootstrap_failed_symbols": self.bootstrap_failed_symbols,
+            "history_last_candle_at": iso(self.history_last_candle_at) if self.history_last_candle_at else None,
             "last_scan": {k: v for k, v in self.last_scan.items() if k != "ts"},
             "totals": dict(self.totals),
             "rejected_by_gate": {g: self.rejected.get(g, 0) for g in GATES} | {

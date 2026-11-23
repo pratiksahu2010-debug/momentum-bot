@@ -82,7 +82,6 @@ def test_gap_clears_history_and_restarts_warmup():
             await engine.on_closed_kline("TESTUSDT", candle)
         assert len(engine.buffers["TESTUSDT"]) == len(ts.base())
         p = float(ts.base()[-1][4])
-        # Skip one full 5-minute interval (expected index 79, received index 80).
         gap_candle = ts.kl(p, p + 0.416, p - 0.104, p + 0.312, 250000, 80)
         await engine.on_closed_kline("TESTUSDT", gap_candle)
         assert len(engine.buffers["TESTUSDT"]) == 1
@@ -102,3 +101,34 @@ def test_symbol_universe_validation():
             pass
         else:
             raise AssertionError(f"invalid symbol universe accepted: {invalid[:3]}")
+
+
+def test_rest_history_seeds_only_closed_contiguous_candles_without_signals():
+    engine = Engine(load(), session=None, notifier=FakeNotifier(), symbols=["TESTUSDT"])
+    rows = ts.base()[-50:]
+    now_ms = int(rows[-1][6]) + 1
+    assert engine._seed_history("TESTUSDT", rows, now_ms=now_ms)
+    assert len(engine.buffers["TESTUSDT"]) == 50
+    assert engine.summary()["symbols_ready"] == 1
+    assert engine.notifier.msgs == []
+    assert engine.last_seen["TESTUSDT"] == int(rows[-1][0])
+
+
+def test_rest_history_ignores_unclosed_candle_and_requires_full_warmup():
+    engine = Engine(load(), session=None, notifier=FakeNotifier(), symbols=["TESTUSDT"])
+    rows = ts.base()[-50:]
+    # The last row is still forming at this point; only 49 closed candles remain.
+    now_ms = int(rows[-1][6])
+    assert not engine._seed_history("TESTUSDT", rows, now_ms=now_ms)
+    assert len(engine.buffers["TESTUSDT"]) == 0
+    assert engine.summary()["symbols_ready"] == 0
+
+
+def test_rest_history_discards_gap_before_seeding():
+    engine = Engine(load(), session=None, notifier=FakeNotifier(), symbols=["TESTUSDT"])
+    rows = ts.base()[-51:]
+    rows = rows[:20] + rows[21:]
+    now_ms = int(rows[-1][6]) + 1
+    # The most recent uninterrupted tail is shorter than the 50-candle requirement.
+    assert not engine._seed_history("TESTUSDT", rows, now_ms=now_ms)
+    assert len(engine.buffers["TESTUSDT"]) == 0

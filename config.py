@@ -27,6 +27,8 @@ class Config:
     interval: str
     interval_seconds: int
     ws_url: str
+    rest_url: str
+    history_bootstrap: bool
     port: int
     log_level: str
     send_startup: bool
@@ -59,8 +61,9 @@ def load() -> Config:
         chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         interval=interval,
         interval_seconds=INTERVAL_SECONDS[interval],
-        # WebSocket market data only; no REST market-data polling.
         ws_url=os.getenv("BINANCE_WS_URL", "wss://stream.binance.com:443").rstrip("/"),
+        rest_url=os.getenv("BINANCE_REST_URL", "https://api.binance.com").rstrip("/"),
+        history_bootstrap=_b("HISTORY_BOOTSTRAP", True),
         port=_i("PORT", 10000),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         send_startup=_b("SEND_STARTUP", False),
@@ -87,6 +90,8 @@ def load() -> Config:
         raise ValueError("PORT must be between 1 and 65535")
     if not cfg.ws_url.startswith(("wss://", "ws://")):
         raise ValueError("BINANCE_WS_URL must use ws:// or wss://")
+    if not cfg.rest_url.startswith(("https://", "http://")):
+        raise ValueError("BINANCE_REST_URL must use http:// or https://")
     if cfg.lookback < 5:
         raise ValueError("LOOKBACK must be at least 5")
     if cfg.vol_mult <= 0 or cfg.range_mult <= 0:
