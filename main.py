@@ -100,6 +100,7 @@ async def resolve_symbols(session, configured):
         result.update({
             "replacements": replacements,
             "active_total": len(kept),
+            "selected_total": len(kept),
             "target_total": len(configured),
         })
         log.info(
@@ -111,7 +112,8 @@ async def resolve_symbols(session, configured):
         # The known delisted pairs are already removed from symbols.py. If the
         # metadata endpoint itself is unreachable, use that cleaned static core.
         result["validation_error"] = str(exc)[:240]
-        result["active_total"] = len(configured)
+        result["active_total"] = None
+        result["selected_total"] = len(configured)
         result["target_total"] = len(configured)
         log.warning("Binance live symbol validation unavailable; using cleaned static universe: %s", exc)
         return list(configured), result
@@ -139,8 +141,9 @@ async def main():
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", cfg.port)
         await site.start()
-        log.info("health server on :%d | %d validated Binance WS streams | %s",
-                 cfg.port, len(symbols), cfg.interval)
+        stream_label = "validated" if universe_status.get("validation_ok") else "static fallback (validation unavailable)"
+        log.info("health server on :%d | %d Binance WS streams (%s) | %s",
+                 cfg.port, len(symbols), stream_label, cfg.interval)
 
         if cfg.send_startup:
             await notifier.send(
