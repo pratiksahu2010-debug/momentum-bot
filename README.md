@@ -14,7 +14,8 @@ Signal-only Telegram bot. It scans the same fixed universe of 120 Binance Spot U
 ## Startup history bootstrap
 - Default: `HISTORY_BOOTSTRAP=true`; set it to `false` to return to WebSocket-only warm-up.
 - REST base URL: `BINANCE_REST_URL` (default `https://api.binance.com`).
-- The bot requests up to 60 recent klines per symbol from Binance public market-data REST (`https://data-api.binance.vision`) with two in-flight requests and a 250 ms global request-start spacing. If Binance returns HTTP 418/429, the remaining REST bootstrap is aborted immediately; it does not hammer the endpoint with retries. The live WebSocket starts immediately and continues independently while history is fetched.
+- The bot requests up to 60 recent klines per symbol from Binance public market-data REST (`https://data-api.binance.vision`) with two in-flight requests and a 250 ms global request-start spacing. If Binance returns HTTP 418/429, it stops the current batch, honors `Retry-After`, and retries only the symbols still missing after the cooldown. It does not hammer the endpoint while the IP is restricted. The live WebSocket continues independently during the wait.
+- Binance's public ZIP archive (`data.binance.vision/data/spot/daily/...`) is useful for historical research, but daily files are published the next day; they cannot supply the current session's missing candles. The bot therefore does not use stale archive candles to bridge a live-data gap or create misleading indicator history.
 - Each symbol needs `max(50, LOOKBACK + 16)` contiguous closed candles. With the default 5-minute interval, a successful bootstrap normally makes all 120 symbols strategy-ready shortly after the WebSocket begins delivering fresh closed candles.
 - Health reports bootstrap loaded/failed counts separately from live WebSocket candle timestamps.
 
