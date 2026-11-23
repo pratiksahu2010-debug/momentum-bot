@@ -85,12 +85,14 @@ def load() -> Config:
     )
     if cfg.port < 1 or cfg.port > 65535:
         raise ValueError("PORT must be between 1 and 65535")
+    if not cfg.ws_url.startswith(("wss://", "ws://")):
+        raise ValueError("BINANCE_WS_URL must use ws:// or wss://")
     if cfg.lookback < 5:
         raise ValueError("LOOKBACK must be at least 5")
     if cfg.vol_mult <= 0 or cfg.range_mult <= 0:
         raise ValueError("VOL_MULT and RANGE_MULT must be greater than zero")
-    if not 0 <= cfg.min_body <= 1 or not 0 < cfg.close_loc <= 1:
-        raise ValueError("MIN_BODY must be 0..1 and CLOSE_LOC must be >0..1")
+    if not 0 <= cfg.min_body <= 1 or not 0 < cfg.close_loc < 1:
+        raise ValueError("MIN_BODY must be 0..1 and CLOSE_LOC must be strictly between 0 and 1")
     if not 0 <= cfg.rsi_min < cfg.rsi_max <= 100:
         raise ValueError("RSI_MIN and RSI_MAX must satisfy 0 <= min < max <= 100")
     if cfg.max_ext_atr <= 0 or cfg.max_range_atr < cfg.range_mult:
