@@ -12,18 +12,24 @@ Signal-only Telegram bot. It scans the same fixed universe of 120 Binance Spot U
 ## Startup warm-up
 WebSocket-only means there is no REST candle-history download. Each symbol needs `max(50, LOOKBACK + 16)` closed candles before its existing indicators can be evaluated. With the default 5-minute interval and 50-candle minimum, allow approximately **4 hours 10 minutes** after a fresh process start before all symbols are ready. A symbol is evaluated after its history is ready; no strategy thresholds or indicator calculations are changed. The first qualified candidate for each symbol during warm-up is suppressed, matching the existing warm-up safety behavior.
 
-## Existing momentum strategy (unchanged)
-| Gate | Default |
-|---|---|
-| Quote-volume spike vs lookback average | >= 3.0x |
-| Range expansion vs ATR(14) | >= 1.8 ATR |
-| Candle body / close location | >= 60% / top or bottom 25% |
-| Donchian breakout | Close beyond prior 20-candle high/low |
-| RSI(14) | 58–82 LONG; mirrored for SHORT |
-| Anti-chase | <= 4 ATR from EMA20 |
-| Liquidity floor | Average quote volume >= 15,000 |
+## Balanced four-gate momentum strategy
+Exactly **four setup conditions** are mandatory. LONG and SHORT use mirrored breakout logic.
 
-Risk levels, score formula, minimum score (55), 90-minute symbol cooldown, six alerts/hour and three alerts per scan are unchanged. Each completed kline event is handled independently; Telegram sends remain serialized.
+| Priority | Mandatory setup gate | Default |
+|---|---|---|
+| 1 | Average quote-volume liquidity | >= 12,000 |
+| 2 | Quote-volume explosion | >= 2.0x lookback average |
+| 3 | Candle body strength | >= 55% of candle range |
+| 4 | Donchian breakout | Close above prior 20-candle high (LONG) or below prior 20-candle low (SHORT) |
+
+The following are deliberately **not additional setup gates**:
+- Range expansion (1.5x reference) contributes to score, not setup eligibility.
+- Close location (70% reference) and RSI(14) (58–82) contribute to the quality score.
+- EMA 9/21 and VWAP are not mandatory confirmations.
+
+Independent safety controls remain active after the four gates: maximum candle range (5 ATR), reject a breakout already confirmed on the previous candle, maximum breakout extension (3.5 ATR), and structural stop validation (stop must remain beyond the signal candle and within the 1.8 ATR risk ceiling). These controls can still reject an unsafe or late setup.
+
+The minimum score remains 48/100. Cooldown is 0 minutes; alert caps remain six per hour and three per scan. This is a signal-only system and does not execute orders.
 
 ## Health endpoints
 - `/ping`: empty-body HTTP 200 for an external cron/uptime monitor.
