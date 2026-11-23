@@ -23,7 +23,8 @@ def test_breakout_extension_cap_is_enforced():
     candles = ts.base()
     p = float(candles[-1][4])
     candles.append(ts.kl(p, p + 1.2, p - 0.01, p + 1.1, 250000, 79))
-    ev = evaluate("TESTUSDT", candles, load())
+    cfg = replace(load(), max_ext_atr=3.5)
+    ev = evaluate("TESTUSDT", candles, cfg)
     assert not ev.passed
     assert ev.reason == "extension", (ev.reason, ev.m)
 
