@@ -1,19 +1,22 @@
 """
 MOMENTUM EXPLOSION detector (single module).
 
-Only 4 measurements, on the last CLOSED candle:
-  1. Quote-volume spike   : volume vs 20-candle average
-  2. Range expansion      : candle range vs ATR(14) (ATR excludes the signal candle)
-  3. Channel breakout     : close beyond the prior 20-candle high/low (Donchian)
-  4. RSI(14) + EMA20 gap  : strength band and anti-chase filter
+Hard gates are deliberately minimal:
+  1. Liquidity floor
+  2. Quote-volume spike vs the prior LOOKBACK candles
+  3. Range expansion vs ATR(14)
+  4. Strong candle body and close location
+  5. Donchian breakout in the candle direction
+  6. Reject a breakout that already happened on the previous candle
 
-Gates are evaluated in order; the first failing gate is the rejection reason.
+RSI is retained as a soft scoring factor, not a mandatory gate.
+EMA extension is not a hard rejection filter.
 """
 from dataclasses import dataclass, field
 
-from indicators import atr, ema, rsi
+from indicators import atr, rsi
 
-GATES = ("liquidity", "volume", "range", "body", "breakout", "late_entry", "rsi", "overextended")
+GATES = ("liquidity", "volume", "range", "body", "breakout", "late_entry")
 
 
 @dataclass
@@ -22,7 +25,7 @@ class Eval:
     candle_open: int
     passed: bool
     reason: str
-    depth: int                      # number of gates passed (0..len(GATES))
+    depth: int
     side: str = "-"
     score: float = 0.0
     m: dict = field(default_factory=dict)
@@ -47,7 +50,7 @@ def evaluate(symbol, k, cfg) -> Eval:
     h = [float(x[2]) for x in k]
     l = [float(x[3]) for x in k]
     c = [float(x[4]) for x in k]
-    q = [float(x[7]) for x in k]  # quote volume
+    q = [float(x[7]) for x in k]
     t = int(k[-1][0])
 
     long = c[-1] >= o[-1]
@@ -72,13 +75,11 @@ def evaluate(symbol, k, cfg) -> Eval:
     broke = c[-1] > hh if long else c[-1] < ll
     prev_broke = c[-2] > max(h[-L - 2:-2]) if long else c[-2] < min(l[-L - 2:-2])
     r = rsi(c, 14)
-    e20 = ema(c[:-1], 20)
-    ext = (c[-1] - e20) / a if long else (e20 - c[-1]) / a
-    rsi_ok = cfg.rsi_min <= r <= cfg.rsi_max if long else (100 - cfg.rsi_max) <= r <= (100 - cfg.rsi_min)
+    rsi_dir = r if long else 100 - r
 
     ev.m = {"price": c[-1], "vol_x": round(vol_x, 2), "range_atr": round(range_atr, 2),
             "body": round(body, 2), "close_loc": round(loc, 2), "rsi": round(r, 1),
-            "ext_atr": round(ext, 2), "avg_qvol": round(avg_q), "broke": bool(broke)}
+            "avg_qvol": round(avg_q), "broke": bool(broke)}
 
     checks = (
         avg_q >= cfg.min_avg_qvol,
@@ -87,8 +88,6 @@ def evaluate(symbol, k, cfg) -> Eval:
         body >= cfg.min_body and loc >= cfg.close_loc,
         broke,
         not prev_broke,
-        rsi_ok,
-        ext <= cfg.max_ext_atr and range_atr <= cfg.max_range_atr,
     )
     for i, ok in enumerate(checks):
         if not ok:
@@ -96,8 +95,6 @@ def evaluate(symbol, k, cfg) -> Eval:
             return ev
 
     ev.passed, ev.reason, ev.depth = True, "qualified", len(GATES)
-
-    rsi_dir = r if long else 100 - r
     ev.score = (40 * _clip(vol_x / (cfg.vol_mult * 2))
                 + 30 * _clip(range_atr / (cfg.range_mult * 2))
                 + 15 * _clip((loc - cfg.close_loc) / (1 - cfg.close_loc))
