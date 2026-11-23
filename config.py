@@ -1,3 +1,4 @@
+import math
 import os
 from dataclasses import dataclass
 
@@ -5,7 +6,10 @@ INTERVAL_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h
 
 
 def _f(name, default):
-    return float(os.getenv(name, default))
+    value = float(os.getenv(name, default))
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number")
+    return value
 
 
 def _i(name, default):
@@ -50,12 +54,12 @@ def load() -> Config:
     interval = os.getenv("INTERVAL", "5m")
     if interval not in INTERVAL_SECONDS:
         raise ValueError(f"INTERVAL must be one of {list(INTERVAL_SECONDS)}")
-    return Config(
+    cfg = Config(
         token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         interval=interval,
         interval_seconds=INTERVAL_SECONDS[interval],
-        # Binance documents both :443 and :9443 for Spot market-data streams.
+        # WebSocket market data only; no REST market-data polling.
         ws_url=os.getenv("BINANCE_WS_URL", "wss://stream.binance.com:443").rstrip("/"),
         port=_i("PORT", 10000),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -79,3 +83,24 @@ def load() -> Config:
         max_per_scan=_i("MAX_PER_SCAN", 3),
         min_score=_f("MIN_SCORE", 55),
     )
+    if cfg.port < 1 or cfg.port > 65535:
+        raise ValueError("PORT must be between 1 and 65535")
+    if cfg.lookback < 5:
+        raise ValueError("LOOKBACK must be at least 5")
+    if cfg.vol_mult <= 0 or cfg.range_mult <= 0:
+        raise ValueError("VOL_MULT and RANGE_MULT must be greater than zero")
+    if not 0 <= cfg.min_body <= 1 or not 0 < cfg.close_loc <= 1:
+        raise ValueError("MIN_BODY must be 0..1 and CLOSE_LOC must be >0..1")
+    if not 0 <= cfg.rsi_min < cfg.rsi_max <= 100:
+        raise ValueError("RSI_MIN and RSI_MAX must satisfy 0 <= min < max <= 100")
+    if cfg.max_ext_atr <= 0 or cfg.max_range_atr < cfg.range_mult:
+        raise ValueError("MAX_EXT_ATR must be positive and MAX_RANGE_ATR >= RANGE_MULT")
+    if cfg.min_avg_qvol < 0:
+        raise ValueError("MIN_AVG_QVOL cannot be negative")
+    if cfg.sl_atr <= 0 or cfg.rr1 <= 0 or cfg.rr2 <= cfg.rr1:
+        raise ValueError("SL_ATR and RR1 must be positive and RR2 must be greater than RR1")
+    if cfg.cooldown_min < 0 or cfg.max_per_hour < 1 or cfg.max_per_scan < 1:
+        raise ValueError("COOLDOWN_MIN cannot be negative and signal caps must be positive")
+    if not 0 <= cfg.min_score <= 100:
+        raise ValueError("MIN_SCORE must be between 0 and 100")
+    return cfg
