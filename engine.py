@@ -16,8 +16,9 @@ RECONNECT_MAX_SECONDS = 60
 CONNECTION_ROTATE_SECONDS = 23 * 60 * 60 + 50 * 60
 BATCH_WINDOW_SECONDS = 10
 HISTORY_REQUEST_LIMIT = 100
-HISTORY_CONCURRENCY = 8
-HISTORY_RETRIES = 3
+HISTORY_CONCURRENCY = 2
+HISTORY_RETRIES = 2
+HISTORY_REQUEST_SPACING_SECONDS = 0.25
 
 
 def iso(ts):
@@ -63,6 +64,9 @@ class Engine:
         self.bootstrap_loaded_symbols = 0
         self.bootstrap_failed_symbols = 0
         self.bootstrap_enabled = cfg.history_bootstrap
+        self.history_rate_limited = False
+        self.history_request_lock = asyncio.Lock()
+        self.history_last_request_at = 0.0
         self.history_last_candle_at = None
         self.last_scan = {}
         self.stream_url = self._build_stream_url()
@@ -113,14 +117,32 @@ class Engine:
             return False
 
         selected = contiguous[-self.history_size:]
+        # Bootstrap may finish after the live socket has already delivered candles.
+        # Merge those newer live candles instead of overwriting them with older REST data.
+        existing = list(self.buffers[symbol])
+        if existing:
+            merged = {int(c[0]): c for c in selected}
+            for candle in existing:
+                merged[int(candle[0])] = candle
+            ordered = [merged[k] for k in sorted(merged)]
+            latest_segment = []
+            for candle in ordered:
+                if latest_segment and int(candle[0]) != int(latest_segment[-1][0]) + interval_ms:
+                    latest_segment = []
+                latest_segment.append(candle)
+            selected = latest_segment[-self.history_size:]
+        if len(selected) < self.required_history:
+            return False
         self.buffers[symbol].clear()
         self.buffers[symbol].extend(selected)
-        self.last_seen[symbol] = selected[-1][0]
+        self.last_seen[symbol] = int(selected[-1][0])
         self.warmup_symbols.discard(symbol)
-        self.last_eval[symbol] = {
-            "at": iso(time.time()), "passed": False, "reason": "history_seeded_waiting_for_live_candle",
-            "depth": 0, "side": "-", "score": 0, "metrics": {},
-        }
+        # Do not overwrite a more recent live evaluation with a historical marker.
+        if not existing:
+            self.last_eval[symbol] = {
+                "at": iso(time.time()), "passed": False, "reason": "history_seeded_waiting_for_live_candle",
+                "depth": 0, "side": "-", "score": 0, "metrics": {},
+            }
         self.history_last_candle_at = max(
             self.history_last_candle_at or 0, selected[-1][6] / 1000
         )
@@ -139,7 +161,16 @@ class Engine:
         }
         async with semaphore:
             for attempt in range(HISTORY_RETRIES):
+                if self.history_rate_limited:
+                    return False
                 try:
+                    # Pace request starts across all symbols. Two in flight is enough
+                    # to keep startup moving without a burst against Binance's shared IP limits.
+                    async with self.history_request_lock:
+                        wait = HISTORY_REQUEST_SPACING_SECONDS - (time.monotonic() - self.history_last_request_at)
+                        if wait > 0:
+                            await asyncio.sleep(wait)
+                        self.history_last_request_at = time.monotonic()
                     timeout = aiohttp.ClientTimeout(total=15, connect=8, sock_read=10)
                     async with self.session.get(url, params=params, timeout=timeout) as response:
                         if response.status == 200:
@@ -150,14 +181,16 @@ class Engine:
                             return loaded
                         if response.status in (418, 429):
                             self.errors[f"history_http_{response.status}"] += 1
-                            retry_after = response.headers.get("Retry-After", "1")
-                            try:
-                                delay = min(10.0, max(1.0, float(retry_after)))
-                            except (TypeError, ValueError):
-                                delay = 1.0
-                            if attempt + 1 < HISTORY_RETRIES:
-                                await asyncio.sleep(delay)
-                                continue
+                            # Stop the whole bootstrap on a rate-limit response. Retrying
+                            # every queued symbol can extend an IP ban; live WebSocket data
+                            # must not wait for REST recovery.
+                            self.history_rate_limited = True
+                            retry_after = response.headers.get("Retry-After")
+                            log.warning(
+                                "Binance REST history rate-limited (%s, Retry-After=%s); "
+                                "aborting remaining bootstrap requests and continuing WebSocket-only",
+                                response.status, retry_after or "not supplied",
+                            )
                             return False
                         self.errors[f"history_http_{response.status}"] += 1
                         if response.status >= 500 and attempt + 1 < HISTORY_RETRIES:
@@ -203,8 +236,8 @@ class Engine:
         self.totals["history_bootstrap_loaded_symbols"] = loaded
         self.totals["history_bootstrap_failed_symbols"] = self.bootstrap_failed_symbols
         log.info(
-            "History bootstrap completed: loaded=%d/%d still_warming=%d; WebSocket remains live source",
-            loaded, len(self.symbols), len(self.warmup_symbols),
+            "History bootstrap completed: loaded=%d/%d still_warming=%d rate_limited=%s; WebSocket remains live source",
+            loaded, len(self.symbols), len(self.warmup_symbols), self.history_rate_limited,
         )
 
     async def on_closed_kline(self, symbol, row):
@@ -423,26 +456,31 @@ class Engine:
             log.info("Rotating Binance WebSocket connection before its 24-hour limit")
 
     async def run(self):
-        # Seed history once before the live socket starts. Failures are non-fatal:
-        # remaining symbols continue warming from WebSocket closed candles.
-        await self.bootstrap_history()
+        # Start the live socket immediately. Historical REST seeding runs in the
+        # background and must never delay WebSocket connection or health readiness.
+        bootstrap_task = asyncio.create_task(self.bootstrap_history())
         delay = 1
-        while True:
-            try:
-                await self._consume_connection()
-                delay = 1
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.errors["websocket_disconnects"] += 1
-                self.last_disconnect = {"at": iso(time.time()), "reason": str(exc)[:240]}
-                log.warning("Binance WebSocket disconnected: %s", exc)
-            finally:
-                self.connected = False
-            self.reconnects += 1
-            log.info("Reconnecting to Binance WebSocket in %ss", delay)
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, RECONNECT_MAX_SECONDS)
+        try:
+            while True:
+                try:
+                    await self._consume_connection()
+                    delay = 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.errors["websocket_disconnects"] += 1
+                    self.last_disconnect = {"at": iso(time.time()), "reason": str(exc)[:240]}
+                    log.warning("Binance WebSocket disconnected: %s", exc)
+                finally:
+                    self.connected = False
+                self.reconnects += 1
+                log.info("Reconnecting to Binance WebSocket in %ss", delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, RECONNECT_MAX_SECONDS)
+        finally:
+            if not bootstrap_task.done():
+                bootstrap_task.cancel()
+                await asyncio.gather(bootstrap_task, return_exceptions=True)
 
     def status(self):
         if not self.connected:
@@ -473,6 +511,7 @@ class Engine:
             "warmup_done": not self.warmup_symbols,
             "strategy_ready": not self.warmup_symbols and self.connected and self.status() == "ok",
             "history_bootstrap_enabled": self.bootstrap_enabled,
+            "history_rate_limited": self.history_rate_limited,
             "history_bootstrap_started_at": iso(self.bootstrap_started_at) if self.bootstrap_started_at else None,
             "history_bootstrap_completed_at": iso(self.bootstrap_completed_at) if self.bootstrap_completed_at else None,
             "history_bootstrap_loaded_symbols": self.bootstrap_loaded_symbols,
