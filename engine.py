@@ -49,7 +49,6 @@ class Engine:
         self.suppressed, self.errors = Counter(), Counter()
         self.pending_batches = {}
         self.batch_tasks = {}
-        self.batch_sent_counts = {}
         self.started = time.time()
         self.connected = False
         self.connection_count = 0
@@ -290,15 +289,7 @@ class Engine:
 
         now = time.time()
         candidates = batch["candidates"]
-        already_sent = self.batch_sent_counts.get(open_time, 0)
-        remaining_cap = max(0, self.cfg.max_per_scan - already_sent)
-        sent, suppressed = await self._dispatch(
-            candidates, now, batch["warmup_symbols"], max_per_scan=remaining_cap
-        )
-        self.batch_sent_counts[open_time] = already_sent + sent
-        if len(self.batch_sent_counts) > 24:
-            oldest = min(self.batch_sent_counts)
-            self.batch_sent_counts.pop(oldest, None)
+        sent, suppressed = await self._dispatch(candidates, now, batch["warmup_symbols"])
         rejected = batch["rejected"]
         self.totals["scans"] += 1
         self.totals["evaluated"] += batch["evaluated"]
@@ -315,9 +306,8 @@ class Engine:
         log.info("closed-candle batch eval=%d qualified=%d sent=%d rejected=%s suppressed=%s",
                  batch["evaluated"], len(candidates), sent, dict(rejected), dict(suppressed))
 
-    async def _dispatch(self, candidates, now, warmup_symbols, max_per_scan=None):
+    async def _dispatch(self, candidates, now, warmup_symbols):
         cfg = self.cfg
-        scan_cap = cfg.max_per_scan if max_per_scan is None else max_per_scan
         while self.sent_times and now - self.sent_times[0] > 3600:
             self.sent_times.popleft()
         candidates.sort(key=lambda e: e.score, reverse=True)
@@ -330,10 +320,6 @@ class Engine:
                 reason = "low_score"
             elif now - self.last_signal.get(ev.symbol, 0) < cfg.cooldown_min * 60:
                 reason = "cooldown"
-            elif len(self.sent_times) >= cfg.max_per_hour:
-                reason = "hourly_cap"
-            elif sent >= scan_cap:
-                reason = "scan_cap"
 
             if reason:
                 status = f"suppressed:{reason}"
@@ -477,8 +463,7 @@ class Engine:
                       "rsi_soft_score_band": [c.rsi_min, c.rsi_max],
                       "breakout_extension_atr<=": c.max_ext_atr, "stop_atr<=": c.sl_atr,
                       "cooldown_min": c.cooldown_min,
-                      "max_per_hour": c.max_per_hour, "max_per_scan": c.max_per_scan,
-                      "min_score": c.min_score},
+                      "alert_count_caps": "disabled", "min_score": c.min_score},
             "endpoints": ["/ping", "/health", "/health/qualified", "/health/rejections", "/health/symbol/BTCUSDT"],
         }
 
