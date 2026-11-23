@@ -22,7 +22,7 @@ def test_maximum_range_atr_is_enforced():
 def test_breakout_extension_cap_is_enforced():
     candles = ts.base()
     p = float(candles[-1][4])
-    candles.append(ts.kl(p, p + 1.4, p + 0.1, p + 1.3, 250000, 79))
+    candles.append(ts.kl(p, p + 1.2, p - 0.01, p + 1.1, 250000, 79))
     ev = evaluate("TESTUSDT", candles, load())
     assert not ev.passed
     assert ev.reason == "extension", (ev.reason, ev.m)
@@ -31,7 +31,7 @@ def test_breakout_extension_cap_is_enforced():
 def test_structural_stop_is_never_capped_inside_signal_candle():
     candles = ts.base()
     p = float(candles[-1][4])
-    candles.append(ts.kl(p, p + 0.5, p - 0.02, p + 0.46, 250000, 79))
+    candles.append(ts.kl(p, p + 0.416, p - 0.104, p + 0.312, 250000, 79))
     cfg = replace(load(), sl_atr=0.5)
     ev = evaluate("TESTUSDT", candles, cfg)
     assert not ev.passed
@@ -41,7 +41,7 @@ def test_structural_stop_is_never_capped_inside_signal_candle():
 def test_qualified_stop_is_outside_signal_candle():
     candles = ts.base()
     p = float(candles[-1][4])
-    candles.append(ts.kl(p, p + 0.5, p - 0.02, p + 0.46, 250000, 79))
+    candles.append(ts.kl(p, p + 0.416, p - 0.104, p + 0.312, 250000, 79))
     ev = evaluate("TESTUSDT", candles, load())
     assert ev.passed, (ev.reason, ev.m)
     assert ev.levels["sl"] < float(candles[-1][3])
